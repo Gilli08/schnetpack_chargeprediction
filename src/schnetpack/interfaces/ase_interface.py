@@ -170,7 +170,8 @@ class SpkCalculator(Calculator):
     forces = "forces"
     stress = "stress"
     charges = "charges"
-    implemented_properties = [energy, forces, stress, charges]
+    charge_forces = "charge_forces"
+    implemented_properties = [energy, forces, stress, charges, charge_forces]
 
     def __init__(
         self,
@@ -180,6 +181,7 @@ class SpkCalculator(Calculator):
         force_key: str = "forces",
         stress_key: Optional[str] = None,
         charges_key: Optional[str] = None,
+        charge_force_key: Optional[str] = None,
         energy_unit: Union[str, float] = "kcal/mol",
         position_unit: Union[str, float] = "Angstrom",
         device: Union[str, torch.device] = "cpu",
@@ -219,13 +221,15 @@ class SpkCalculator(Calculator):
         self.force_key = force_key
         self.stress_key = stress_key
         self.charges_key = charges_key
+        self.charge_force_key = charge_force_key
 
         # Mapping between ASE names and model outputs
         self.property_map = {
             self.energy: energy_key,
             self.forces: force_key,
             self.stress: stress_key,
-            self.charges: charges_key,        
+            self.charges: charges_key,
+            self.charge_force: charge_force_key        
         }
 
         self.model = self._load_model(model, device, dtype)
@@ -330,6 +334,15 @@ class SpkCalculator(Calculator):
                 elif prop == self.charges:
                     # ase calculator should return list of shape [len(atoms)]
                     results[prop] = (model_results[model_prop].cpu().data.numpy().reshape(len(atoms)))
+                    
+                    if prop == self.charge_force:
+                        charges_forces = model_results[model_prop].cpu().data.numpy()
+                        results[self.charge_forces] = (
+                            charges_forces.reshape(len(atoms),len(atoms),3))               
+                            #print(model_results.keys())
+                        #print(results[self.charge_forces])
+                        #np.savez("charge_forces.npz",results[self.charge_forces])
+                    
                 else:
                     results[prop] = (
                         model_results[model_prop].cpu().data.numpy()

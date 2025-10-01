@@ -112,6 +112,8 @@ class Charges(nn.Module):
         activation: Callable = F.silu,
         charges_key: str = properties.partial_charges,
         correct_charges: bool = True,
+        correct_charges_fukui: bool = False,
+        charge_forces: bool = False,
     ):
         """
         Args:
@@ -126,6 +128,9 @@ class Charges(nn.Module):
             charges_key: the key under which partial charges will be stored
             correct_charges: If true, forces the sum of partial charges to be the total
                 charge, if provided, and zero otherwise.
+            correct_charges_fukui: Only works with correct_charges and applies a non-uniformly correction learned from features
+                analogous to Fukui functions
+            charge_forces: If autograd of charges is requested to get dq_dR
         """
         super().__init__()
         self.charges_key = charges_key
@@ -139,6 +144,28 @@ class Charges(nn.Module):
             activation=activation,
         )
 
+
+    def dq_dR(self,model, inputs):
+        # make sure positions are grad-enabled
+        inputs[properties.R] = inputs[properties.R].clone().detach().requires_grad_(True)
+
+        outputs = model(inputs)
+        charges = outputs[properties.partial_charges]  # [n_atoms]
+
+        # full Jacobian
+        jac = []
+        for i in range(charges.shape[0]):
+            grad_i = grad(
+                charges[i],
+                inputs[properties.R],
+                retain_graph=True,
+                create_graph=False,
+            )[0]  # shape: [n_atoms, 3]
+            jac.append(grad_i)
+        jac = torch.stack(jac, dim=0)  # [n_atoms, n_atoms, 3]
+        return jac
+
+
     def forward(self, inputs):
         positions = inputs[properties.R]
         l0 = inputs["scalar_representation"]
@@ -148,14 +175,42 @@ class Charges(nn.Module):
 
         charges = self.outnet(l0).squeeze(-1)  # [n_atoms]
 
-        if self.correct_charges:
+        # Charge corrections
+        if self.correct_charges and self.correct_charges_fukui == False:
             sum_charge = snn.scatter_add(charges, idx_m, dim_size=maxm)
             total_charge = snn.scatter_add(inputs[properties.charges],idx_m,dim_size=maxm)
             charge_correction = (total_charge - sum_charge) / natoms
             charge_correction = charge_correction[idx_m]
             charges = charges + charge_correction
         
+        if self.correct_charges and self.correct_charges_fukui: 
+            self.weightnet = spk.nn.build_mlp(
+                n_in=n_in,
+                n_out=1,
+                n_hidden=n_hidden,
+                n_layers=n_layers,
+                activation=activation,
+            )
+            weights = F.softplus(self.weightnet(l0)).squeeze(-1)  # ensure positive weights
+            sum_charge = snn.scatter_add(charges, idx_m, dim_size=maxm)
+            total_charge = snn.scatter_add(inputs[properties.charges], idx_m, dim_size=maxm)
+
+            # weight-normalized correction
+            weight_sum = snn.scatter_add(weights, idx_m, dim_size=maxm)  # per molecule
+            correction = (total_charge - sum_charge) / weight_sum        # per molecule
+            correction = correction[idx_m] * weights                     # distribute with weights
+
+            charges = charges + correction
+
         inputs[self.charges_key] = charges
+        if charge_forces == True:
+            sign = 1.0 #-1.0 if self.negative_dr else 1.0
+            for i in range(len(result[self.property][0])):
+                dy = torch.stack([grad(result[self.property][:, i], inputs[Properties.R],
+                                     grad_outputs=torch.ones_like(result[self.property][:, i]),
+                                     create_graph=False,
+                                     retain_graph=True)[0] for i in range(len(result[self.property][0]))], dim=1)
+            inputs["charge_forces"] = sign * dy
 
         return inputs
 
