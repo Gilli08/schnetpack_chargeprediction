@@ -174,7 +174,7 @@ class SpkCalculator(Calculator):
 
     def __init__(
         self,
-        model: Union[str, nn.Module],
+        model_file: Union[str, nn.Module],
         neighbor_list: Transform,
         energy_key: str = "energy",
         force_key: str = "forces",
@@ -191,7 +191,7 @@ class SpkCalculator(Calculator):
     ):
         """
         Args:
-            model: either path to trained model or model object
+            model_file: either path to trained model or model object
             neighbor_list: SchNetPack neighbor list
             energy_key: name of energies in model (default="energy")
             force_key: name of forces in model (default="forces")
@@ -228,7 +228,7 @@ class SpkCalculator(Calculator):
             self.charges: charges_key,        
         }
 
-        self.model = self._load_model(model, device, dtype)
+        self.model = self._load_model(model_file, device, dtype)
 
         # set up basic conversion factors
         self.energy_conversion = convert_units(energy_unit, "eV")
