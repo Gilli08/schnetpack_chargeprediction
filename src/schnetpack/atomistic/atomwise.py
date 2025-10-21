@@ -146,16 +146,22 @@ class Charges(nn.Module):
         idx_m = inputs[properties.idx_m]
         maxm = int(idx_m[-1]) + 1
 
-        charges = self.outnet(l0).squeeze(-1)  # [n_atoms]
+        charges = self.outnet(l0)
 
         if self.correct_charges:
             sum_charge = snn.scatter_add(charges, idx_m, dim_size=maxm)
-            total_charge = snn.scatter_add(inputs[properties.charges],idx_m,dim_size=maxm)
-            charge_correction = (total_charge - sum_charge) / natoms
+
+            if properties.total_charge in inputs:
+                total_charge = inputs[properties.total_charge][:, None]
+            else:
+                total_charge = torch.zeros_like(sum_charge)
+
+            charge_correction = (total_charge - sum_charge) / natoms.unsqueeze(-1)
             charge_correction = charge_correction[idx_m]
             charges = charges + charge_correction
+
         
-        inputs[self.charges_key] = charges
+        inputs[self.charges_key] = charges.squeeze(-1)
 
         return inputs
 
