@@ -8,7 +8,7 @@ import schnetpack as spk
 import schnetpack.nn as snn
 import schnetpack.properties as properties
 
-__all__ = ["Atomwise", "DipoleMoment", "Polarizability","Charges"]
+__all__ = ["Atomwise", "DipoleMoment", "Polarizability","Charges","SpinCharges"]
 
 
 class Atomwise(nn.Module):
@@ -162,6 +162,94 @@ class Charges(nn.Module):
 
         
         inputs[self.charges_key] = charges.squeeze(-1)
+
+        return inputs
+    
+class SpinCharges(nn.Module):
+    """
+    Predicts spin-resolved alpha and beta charges and enforces:
+      - total charge constraint
+      - multiplicity constraint
+    """
+
+    def __init__(
+        self,
+        n_in: int,
+        n_hidden=None,
+        n_layers: int = 2,
+        activation=F.silu,
+        alpha_key: str = properties.alpha_charges,
+        beta_key: str = properties.beta_charges,
+        correct_spincharges: bool = True,
+    ):
+        super().__init__()
+        self.alpha_key = alpha_key
+        self.beta_key = beta_key
+        self.correct_spincharges = correct_spincharges
+        self.model_outputs = [alpha_key, beta_key]
+
+        # predict q_alpha and q_beta independently but simultaneously
+        self.outnet = spk.nn.build_mlp(
+            n_in=n_in,
+            n_out=2,      
+            n_hidden=n_hidden,
+            n_layers=n_layers,
+            activation=activation,
+        )
+
+    def forward(self, inputs):
+
+        l0 = inputs["scalar_representation"]
+        idx_m = inputs[properties.idx_m]
+        natoms = inputs[properties.n_atoms]
+        Z_atoms = inputs[properties.Z].float()
+        maxm = int(idx_m[-1]) + 1
+
+        # Predict per-atom alpha and beta charges
+        q = self.outnet(l0)         # shape: (natoms, 2)
+        q_alpha_pred = q[:, 0:1]
+        q_beta_pred  = q[:, 1:2]
+
+        if self.correct_spincharges:
+            # spin charge sums
+            Q_alpha_pred = snn.scatter_add(q_alpha_pred, idx_m, dim_size=maxm)
+            Q_beta_pred  = snn.scatter_add(q_beta_pred,  idx_m, dim_size=maxm)
+
+            # required total charge
+            if properties.total_charge in inputs:
+                Q_total = inputs[properties.total_charge][:, None]
+            else:
+                raise ValueError("Total_charge required for spin‐resolved charge correction")
+
+            # required multiplicity
+            if properties.spin_multiplicity in inputs:
+                M = inputs[properties.spin_multiplicity][:, None]
+            else:
+                raise ValueError("Multiplicity required for spin‐resolved charge correction")
+
+            # Solve physical constraints:
+            Z_sum = snn.scatter_add(Z_atoms, idx_m, dim_size=maxm)[:, None]
+            Q_alpha_req = 0.5*(Z_sum+Q_total - (M - 1))
+            Q_beta_req  = 0.5*(Z_sum+Q_total + (M - 1))
+
+            # corrections
+            corr_alpha = (Q_alpha_req - Q_alpha_pred) / natoms.unsqueeze(-1)
+            corr_beta  = (Q_beta_req  - Q_beta_pred ) / natoms.unsqueeze(-1)
+
+            # map atomwise
+            corr_alpha = corr_alpha[idx_m]
+            corr_beta  = corr_beta[idx_m]
+
+            # apply corrections
+            q_alpha = q_alpha_pred + corr_alpha
+            q_beta  = q_beta_pred  + corr_beta
+
+        else:
+            q_alpha = q_alpha_pred
+            q_beta = q_beta_pred
+
+        inputs[self.alpha_key] = q_alpha.squeeze(-1)
+        inputs[self.beta_key]  = q_beta.squeeze(-1)
 
         return inputs
 

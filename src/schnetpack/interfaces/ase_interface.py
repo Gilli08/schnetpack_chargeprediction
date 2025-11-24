@@ -170,7 +170,9 @@ class SpkCalculator(Calculator):
     forces = "forces"
     stress = "stress"
     charges = "charges"
-    implemented_properties = [energy, forces, stress, charges]
+    alpha_charges = "alpha_charges"
+    beta_charges = "beta_charges"
+    implemented_properties = [energy, forces, stress, charges,alpha_charges,beta_charges]
 
     def __init__(
         self,
@@ -180,6 +182,8 @@ class SpkCalculator(Calculator):
         force_key: str = "forces",
         stress_key: Optional[str] = None,
         charges_key: Optional[str] = None,
+        alpha_charges_key: Optional[str] = None,
+        beta_charges_key: Optional[str] = None,
         energy_unit: Union[str, float] = "kcal/mol",
         position_unit: Union[str, float] = "Angstrom",
         device: Union[str, torch.device] = "cpu",
@@ -219,13 +223,17 @@ class SpkCalculator(Calculator):
         self.force_key = force_key
         self.stress_key = stress_key
         self.charges_key = charges_key
+        self.alpha_charges_key = alpha_charges_key
+        self.beta_charges_key = beta_charges_key
 
         # Mapping between ASE names and model outputs
         self.property_map = {
             self.energy: energy_key,
             self.forces: force_key,
             self.stress: stress_key,
-            self.charges: charges_key,        
+            self.charges: charges_key,  
+            self.alpha_charges: alpha_charges_key,  
+            self.beta_charges: beta_charges_key,        
         }
 
         self.model = self._load_model(model_file, device, dtype)
@@ -328,6 +336,12 @@ class SpkCalculator(Calculator):
                         * self.property_units[prop]
                     )
                 elif prop == self.charges:
+                    # ase calculator should return list of shape [len(atoms)]
+                    results[prop] = (model_results[model_prop].cpu().data.numpy().reshape(len(atoms)))
+                elif prop == self.alpha_charges:
+                    # ase calculator should return list of shape [len(atoms)]
+                    results[prop] = (model_results[model_prop].cpu().data.numpy().reshape(len(atoms)))
+                elif prop == self.beta_charges:
                     # ase calculator should return list of shape [len(atoms)]
                     results[prop] = (model_results[model_prop].cpu().data.numpy().reshape(len(atoms)))
                 else:
