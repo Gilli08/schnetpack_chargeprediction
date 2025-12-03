@@ -38,6 +38,36 @@ header = """
 /____/\___/_/ /_/_/ |_/\___/\__/_/    \__,_/\___/_/|_|
 """
 
+class SpkCSVLogger(CSVLogger):
+    def _check_hyperparams_type(self, obj):
+    # Recursively turn everything into YAML-friendly primitives
+        from collections.abc import Mapping, Sequence
+
+        # pass through simple types
+        if isinstance(obj, (int, float, bool, str)) or obj is None:
+            return obj
+
+        # dict-like
+        if isinstance(obj, Mapping):
+            return {k: self._check_hyperparams_type(v) for k, v in obj.items()}
+
+        # array-like
+        if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
+            result = []
+            for v in obj:
+                try:
+                    result.append(self._check_hyperparams_type(v))
+                except TypeError:
+                    # fallback: str to avoid uncommon types
+                    result.append(str(v))
+            return result
+
+        # anything else -> string representation
+        return str(obj)
+
+    def log_hyperparams(self, params, *args, **kwargs):
+        hyperparams_checked = self._check_hyperparams_type(params)
+        return super().log_hyperparams(hyperparams_checked, *args, **kwargs)
 
 @hydra.main(config_path="configs", config_name="train", version_base="1.2")
 def train(config: DictConfig):
