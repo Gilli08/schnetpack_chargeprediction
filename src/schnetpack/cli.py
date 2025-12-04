@@ -13,6 +13,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from pytorch_lightning import LightningModule, LightningDataModule, Callback, Trainer
 from pytorch_lightning import seed_everything
 from pytorch_lightning.loggers.logger import Logger
+from pytorch_lightning.loggers import CSVLogger
 
 import schnetpack as spk
 from schnetpack.utils import str2class
