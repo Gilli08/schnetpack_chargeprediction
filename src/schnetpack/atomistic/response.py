@@ -29,6 +29,7 @@ class Forces(nn.Module):
         energy_key: str = properties.energy,
         force_key: str = properties.forces,
         stress_key: str = properties.stress,
+        retain_graph: bool = False,
     ):
         """
         Args:
@@ -44,6 +45,7 @@ class Forces(nn.Module):
         self.energy_key = energy_key
         self.force_key = force_key
         self.stress_key = stress_key
+        self.retain_graph = retain_graph
         self.model_outputs = []
         if calc_forces:
             self.model_outputs.append(force_key)
@@ -60,11 +62,13 @@ class Forces(nn.Module):
         Epred = inputs[self.energy_key]
 
         go: List[Optional[torch.Tensor]] = [torch.ones_like(Epred)]
+        retain_graph = bool(getattr(self, "retain_graph", False)) or self.training
         grads = grad(
             [Epred],
             [inputs[prop] for prop in self.required_derivatives],
             grad_outputs=go,
             create_graph=self.training,
+            retain_graph=retain_graph,
         )
 
         if self.calc_forces:
@@ -462,3 +466,4 @@ class Strain(nn.Module):
             inputs[properties.offsets][:, None, :], strain_ij
         ).squeeze(1)
         return inputs
+

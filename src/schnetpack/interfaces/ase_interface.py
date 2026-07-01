@@ -172,7 +172,10 @@ class SpkCalculator(Calculator):
     charges = "charges"
     alpha_charges = "alpha_charges"
     beta_charges = "beta_charges"
-    implemented_properties = [energy, forces, stress, charges,alpha_charges,beta_charges]
+    chi = "chi"
+    hardness = "hardness"
+    sextet_weight = "boltzmann_weight_sextet"
+    implemented_properties = [energy, forces, stress, charges,alpha_charges,beta_charges, chi, hardness,sextet_weight]
 
     def __init__(
         self,
@@ -184,7 +187,10 @@ class SpkCalculator(Calculator):
         charges_key: Optional[str] = None,
         alpha_charges_key: Optional[str] = None,
         beta_charges_key: Optional[str] = None,
+        chi_key: Optional[str] = None,
+        hardness_key: Optional[str] = None,
         energy_unit: Union[str, float] = "kcal/mol",
+        sextet_weight_key: Optional[str] = None,
         position_unit: Union[str, float] = "Angstrom",
         device: Union[str, torch.device] = "cpu",
         dtype: torch.dtype = torch.float32,
@@ -225,6 +231,10 @@ class SpkCalculator(Calculator):
         self.charges_key = charges_key
         self.alpha_charges_key = alpha_charges_key
         self.beta_charges_key = beta_charges_key
+        self.chi_key = chi_key
+        self.hardness_key = hardness_key
+        self.sextet_weight_key = sextet_weight_key
+        
 
         # Mapping between ASE names and model outputs
         self.property_map = {
@@ -233,8 +243,18 @@ class SpkCalculator(Calculator):
             self.stress: stress_key,
             self.charges: charges_key,  
             self.alpha_charges: alpha_charges_key,  
-            self.beta_charges: beta_charges_key,        
+            self.beta_charges: beta_charges_key,  
+            self.chi_key: chi_key,
+            self.hardness_key: hardness_key,  
+            self.sextet_weight_key: sextet_weight_key,    
         }
+        
+        #self.property_units[self.sextet_weight] = 1.0
+        
+        if chi_key is not None:
+            self.property_units[chi_key] = 1.0
+        if hardness_key is not None:
+            self.property_units[hardness_key] = 1.0
 
         self.model = self._load_model(model_file, device, dtype)
 
@@ -344,6 +364,14 @@ class SpkCalculator(Calculator):
                 elif prop == self.beta_charges:
                     # ase calculator should return list of shape [len(atoms)]
                     results[prop] = (model_results[model_prop].cpu().data.numpy().reshape(len(atoms)))
+                elif prop == self.chi:
+                    results[prop] = (model_results[model_prop].cpu().data.numpy().reshape(len(atoms)))
+                elif prop == self.hardness:
+                    results[prop] = (model_results[model_prop].cpu().data.numpy().reshape(len(atoms)))
+                elif prop == self.sextet_weight:
+                    results[prop] = (
+                        model_results[model_prop].cpu().data.numpy().reshape(-1)[0]
+                    )
                 else:
                     results[prop] = (
                         model_results[model_prop].cpu().data.numpy()

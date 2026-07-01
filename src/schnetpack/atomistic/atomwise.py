@@ -7,9 +7,24 @@ import torch.nn.functional as F
 import schnetpack as spk
 import schnetpack.nn as snn
 import schnetpack.properties as properties
+import math
 
-__all__ = ["Atomwise", "DipoleMoment", "Polarizability","Charges","SpinCharges"]
+__all__ = [
+    "Atomwise",
+    "DipoleMoment",
+    "Polarizability",
+    "Charges",
+    "SpinCharges",
+    "QEqCharges",
+    "ElementQEqCharges",
+    "EMLEStaticHead",
+    "EMLEStaticParamHead",
+    "EMLEQEqStatic",
+    "ExternalCoulombEmbedding",
+]
 
+K_E_KJMOL_NM_E2 = 138.935456
+K_E_KJMOL_ANG_E2 = K_E_KJMOL_NM_E2 * 10.0
 
 class Atomwise(nn.Module):
     """
@@ -86,7 +101,436 @@ class Atomwise(nn.Module):
 
         inputs[self.output_key] = y
         return inputs
+ 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import schnetpack.nn as snn
+import schnetpack.properties as properties
+
+class ElementQEqCharges(nn.Module):
+    """
+    Conservative QEq head with optional off-diagonal couplings.
+    - chi(Z), Jii(Z) are learnable tables (geometry-independent).
+    - Optional Jij(Rij) introduces geometry dependence but remains conservative.
+    """
+
+    def __init__(
+        self,
+        charges_key="charges",
+        chi_key="chi_qeq",
+        hardness_key="Jii_qeq",
+        max_z=100,
+        eps_hardness=1e-6,
+        correct_charges=True,
+        use_offdiag=False,
+        offdiag_cutoff=10.0,
+        learn_gamma: bool = True,
+        init_gamma: float = 1.0,
+        gamma_positive: bool = True,
+        gamma_key: str = "gamma_qeq",
+        # offdiag: Gaussian-screened Coulomb using element widths a_Z (learnable or fixed)
+        learn_widths=False,
+        init_width=1.0,   # in distance units used internally (Å in SPK inputs)
+        init_chi=0.0,
+        init_logJ=0.0,
+        phi_key=None,     # if provided, use inputs[phi_key], else 0
+    ):
+        super().__init__()
+        self.charges_key = charges_key
+        self.chi_key = chi_key
+        self.hardness_key = hardness_key
+        self.max_z = max_z
+        self.eps_hardness = eps_hardness
+        self.correct_charges = correct_charges
+        self.use_offdiag = use_offdiag
+        self.offdiag_cutoff = offdiag_cutoff
+        self.learn_widths = learn_widths
+        self.phi_key = phi_key
+
+        self.chi_table = nn.Embedding(max_z + 1, 1)
+        self.logJ_table = nn.Embedding(max_z + 1, 1)
+        nn.init.constant_(self.chi_table.weight, init_chi)
+        nn.init.constant_(self.logJ_table.weight, init_logJ)
+
+        if use_offdiag:
+            # widths a_Z used in erf screening: erf(R / sqrt(a_i^2+a_j^2)) / R
+            self.width_table = nn.Embedding(max_z + 1, 1)
+            nn.init.constant_(self.width_table.weight, init_width)
+            if not learn_widths:
+                for p in self.width_table.parameters():
+                    p.requires_grad_(False)
+                    
+        self.learn_gamma = learn_gamma
+        self.gamma_positive = gamma_positive
+        self.gamma_key = gamma_key
+
+        # store a raw parameter; we map it -> gamma in forward
+        gamma_raw = torch.tensor(float(init_gamma))
+        if gamma_positive:
+            # inverse softplus so that softplus(raw) ~= init_gamma
+            # avoid init_gamma<=0
+            init_gamma_safe = max(float(init_gamma), 1e-6)
+            gamma_raw = torch.log(torch.exp(torch.tensor(init_gamma_safe)) - 1.0)
+
+        self.gamma_raw = nn.Parameter(gamma_raw)
+
+        if not learn_gamma:
+            self.gamma_raw.requires_grad_(False)
+
+        # optional: expose gamma for logging/extraction
+        self.model_outputs = list(getattr(self, "model_outputs", []))
+        if self.gamma_key not in self.model_outputs:
+            self.model_outputs.append(self.gamma_key)
+
+        self.model_outputs = [charges_key, chi_key, hardness_key]
+
+    def _phi(self, inputs, like):
+        if self.phi_key is not None and self.phi_key in inputs:
+            phi = inputs[self.phi_key]
+            if phi.dim() == 1:
+                phi = phi.unsqueeze(-1)
+            return phi.to(like)
+        return torch.zeros_like(like)
+
+    def forward(self, inputs):
+        Z = inputs[properties.Z].long()              # (N_atoms,)
+        idx_m = inputs[properties.idx_m]             # (N_atoms,)
+        natoms = inputs[properties.n_atoms]          # (N_mols,)
+        maxm = int(idx_m[-1]) + 1
+
+        chi = self.chi_table(Z)                      # (N_atoms,1)
+        Jii = F.softplus(self.logJ_table(Z)) + self.eps_hardness
+
+        phi = self._phi(inputs, chi)                 # (N_atoms,1) or 0
+        g = chi + phi                                # (N_atoms,1)
+
+        if properties.total_charge in inputs:
+            Q = inputs[properties.total_charge].unsqueeze(-1)  # (N_mols,1)
+        else:
+            Q = torch.zeros((maxm, 1), device=chi.device, dtype=chi.dtype)
+
+        if not self.use_offdiag:
+            # ---- diagonal closed form
+            invJ = 1.0 / Jii
+            A = snn.scatter_add(invJ, idx_m, dim_size=maxm)                 # (N_mols,1)
+            B = snn.scatter_add(g * invJ, idx_m, dim_size=maxm)             # (N_mols,1)
+            lam = -(Q + B) / A                                              # (N_mols,1)
+            q = -(g + lam[idx_m]) / Jii                                     # (N_atoms,1)
+
+        else:
+            # ---- off-diagonal: build per-molecule dense systems and solve
+            # NOTE: This is a simple implementation. For speed you can batch/pack.
+            positions = inputs[properties.R]          # (N_atoms,3)
+            q_list = []
+            start = 0
+            for m in range(maxm):
+                n = int(natoms[m].item())
+                sl = slice(start, start + n)
+
+                Zm = Z[sl]
+                gm = g[sl].squeeze(-1)                # (n,)
+                Jiim = Jii[sl].squeeze(-1)            # (n,)
+                Qm = Q[m].squeeze(-1)                 # scalar
+
+                Rm = positions[sl]                    # (n,3)
+                # pair distances
+                dR = Rm[:, None, :] - Rm[None, :, :]
+                Rij = torch.linalg.norm(dR + 1e-12, dim=-1)  # (n,n)
+
+                # build A
+                A = torch.diag(Jiim)  # (n,n)
+
+                # screened Coulomb off-diagonal
+                widths = self.width_table(Zm).squeeze(-1)               # (n,)
+                sigma = torch.sqrt(widths[:, None] ** 2 + widths[None, :] ** 2) + 1e-12
+
+                dR = Rm[:, None, :] - Rm[None, :, :]
+                Rij = torch.linalg.norm(dR, dim=-1)                     # (n,n)
+
+                eye = torch.eye(n, device=Rm.device, dtype=torch.bool)
+                Rij_safe = Rij.masked_fill(eye, 1.0)
+
+                Jij = torch.erf(Rij_safe / sigma) / Rij_safe
+                Jij = Jij.masked_fill(eye, 0.0)
+
+                if self.offdiag_cutoff is not None:
+                    Jij = Jij * (Rij <= self.offdiag_cutoff)
+
+                gamma = F.softplus(self.gamma_raw) if self.gamma_positive else self.gamma_raw
+                A = A + gamma * Jij
+                
+                # KKT system
+                K = torch.zeros((n + 1, n + 1), device=Rm.device, dtype=Rm.dtype)
+                K[:n, :n] = A
+                K[:n, n] = 1.0
+                K[n, :n] = 1.0
+                K[n, n] = 0.0
+
+                b = torch.zeros((n + 1,), device=Rm.device, dtype=Rm.dtype)
+                b[:n] = -gm
+                b[n] = Qm
+
+                x = torch.linalg.solve(K, b)          # (n+1,)
+                qm = x[:n].unsqueeze(-1)              # (n,1)
+                q_list.append(qm)
+
+                start += n
+
+            q = torch.cat(q_list, dim=0)              # (N_atoms,1)
+
+        if self.correct_charges:
+            # tiny correction to enforce exact sum(q)=Q per molecule
+            q_sum = snn.scatter_add(q, idx_m, dim_size=maxm)
+            dq = (Q - q_sum) / natoms.unsqueeze(-1)
+            q = q + dq[idx_m]
+
+        inputs[self.chi_key] = chi.squeeze(-1)
+        inputs[self.hardness_key] = Jii.squeeze(-1)
+        inputs[self.charges_key] = q.squeeze(-1)
         
+        gamma = F.softplus(self.gamma_raw) if self.gamma_positive else self.gamma_raw
+        inputs[self.gamma_key] = gamma.detach()  # or keep grad if you want
+        return inputs
+class QEqCharges(nn.Module):
+    """
+    QEq layer with optional off-diagonal couplings.
+
+    Diagonal mode:
+        E(q) = sum_i [ chi_i q_i + 1/2 Jii_i q_i^2 ] + sum_i q_i phi_i
+        subject to sum_i q_i = Q_total
+
+    Off-diagonal mode:
+        E(q) = sum_i [ chi_i q_i ] + sum_i q_i phi_i
+             + 1/2 sum_i Jii_i q_i^2
+             + 1/2 gamma sum_{i!=j} Jij_ij q_i q_j
+        subject to sum_i q_i = Q_total
+
+    where Jij is a screened Coulomb kernel:
+        Jij = erf(Rij / sigma_ij) / Rij
+        sigma_ij = sqrt(sigma_i^2 + sigma_j^2)
+
+    Notes
+    -----
+    - Keeps your existing Gaussian self-energy stabilization on the diagonal.
+    - In offdiag mode, the same sigma can be reused for both self-term and Jij screening.
+    - All terms remain conservative since charges come from minimizing an energy.
+    """
+    def __init__(
+        self,
+        n_in: int,
+        n_hidden=None,
+        n_layers: int = 2,
+        activation=F.silu,
+        charges_key="charges",
+        chi_key="chi_qeq",
+        hardness_key="Jii_qeq",
+        phi_key=None,
+        eps_hardness: float = 1e-6,
+        correct_charges: bool = True,
+
+        # --- Behler-style diagonal stabilization ---
+        use_gaussian_self_energy: bool = True,
+        sigma_min: float = 0.3,
+        sigma_max: float = 3.0,
+        predict_sigma: bool = True,
+        sigma_key: str = "sigma_qeq",
+        jii_min: float = 0.0,
+
+        # --- NEW: off-diagonal QEq ---
+        use_offdiag: bool = False,
+        offdiag_cutoff: Optional[float] = 10.0,
+        gamma_key: str = "gamma_qeq",
+        init_gamma: float = 1.0,
+        gamma_positive: bool = True,
+        learn_gamma: bool = True,
+    ):
+        super().__init__()
+        self.charges_key = charges_key
+        self.chi_key = chi_key
+        self.hardness_key = hardness_key
+        self.phi_key = phi_key
+        self.eps_hardness = eps_hardness
+        self.correct_charges = correct_charges
+
+        self.use_gaussian_self_energy = use_gaussian_self_energy
+        self.sigma_min = float(sigma_min)
+        self.sigma_max = float(sigma_max)
+        self.predict_sigma = predict_sigma
+        self.sigma_key = sigma_key
+        self.jii_min = float(jii_min)
+
+        self.use_offdiag = use_offdiag
+        self.offdiag_cutoff = offdiag_cutoff
+        self.gamma_key = gamma_key
+        self.gamma_positive = gamma_positive
+        self.learn_gamma = learn_gamma
+
+        self.chi_net = spk.nn.build_mlp(
+            n_in=n_in, n_out=1, n_hidden=n_hidden, n_layers=n_layers, activation=activation
+        )
+        self.jii_net = spk.nn.build_mlp(
+            n_in=n_in, n_out=1, n_hidden=n_hidden, n_layers=n_layers, activation=activation
+        )
+
+        # sigma used for Gaussian self-energy and, in offdiag mode, for screened Jij
+        if self.use_gaussian_self_energy or self.use_offdiag:
+            if self.predict_sigma:
+                self.sigma_net = spk.nn.build_mlp(
+                    n_in=n_in, n_out=1, n_hidden=n_hidden, n_layers=n_layers, activation=activation
+                )
+
+        gamma_raw = torch.tensor(float(init_gamma))
+        if gamma_positive:
+            init_gamma_safe = max(float(init_gamma), 1e-6)
+            gamma_raw = torch.log(torch.exp(torch.tensor(init_gamma_safe)) - 1.0)
+
+        self.gamma_raw = nn.Parameter(gamma_raw)
+        if not learn_gamma:
+            self.gamma_raw.requires_grad_(False)
+
+        self.model_outputs = [charges_key, chi_key, hardness_key]
+        if self.use_gaussian_self_energy or self.use_offdiag:
+            self.model_outputs.append(self.sigma_key)
+        if self.use_offdiag:
+            self.model_outputs.append(self.gamma_key)
+
+    def _get_phi(self, inputs, like):
+        if self.phi_key is not None and self.phi_key in inputs:
+            phi = inputs[self.phi_key]
+            if phi.dim() == 1:
+                phi = phi.unsqueeze(-1)
+            return phi.to(like)
+        return torch.zeros_like(like)
+
+    def _get_sigma(self, l0, inputs):
+        if self.predict_sigma:
+            sigma_raw = self.sigma_net(l0)
+            sigma = F.softplus(sigma_raw) + self.sigma_min
+        else:
+            sigma = inputs[self.sigma_key]
+            if sigma.dim() == 1:
+                sigma = sigma.unsqueeze(-1)
+
+        sigma = sigma.clamp(self.sigma_min, self.sigma_max)
+        return sigma
+
+    def _get_gamma(self):
+        return F.softplus(self.gamma_raw) if self.gamma_positive else self.gamma_raw
+
+    def forward(self, inputs):
+        l0 = inputs["scalar_representation"]         # (N, n_in)
+        idx_m = inputs[properties.idx_m]             # (N,)
+        natoms = inputs[properties.n_atoms]          # (n_mol,)
+        maxm = int(idx_m[-1]) + 1
+
+        chi = self.chi_net(l0)                       # (N,1)
+        jii_raw = self.jii_net(l0)                   # (N,1)
+
+        eta = F.softplus(jii_raw) + self.eps_hardness
+        if self.jii_min > 0.0:
+            eta = eta.clamp_min(self.jii_min)
+
+        phi = self._get_phi(inputs, chi)             # (N,1)
+
+        sigma = None
+        if self.use_gaussian_self_energy or self.use_offdiag:
+            sigma = self._get_sigma(l0, inputs)
+            inputs[self.sigma_key] = sigma.squeeze(-1)
+
+        # diagonal self term
+        if self.use_gaussian_self_energy:
+            self_term = 1.0 / (sigma * math.sqrt(math.pi))
+            jii_eff = eta + self_term
+        else:
+            jii_eff = eta
+
+        if properties.total_charge in inputs:
+            Q = inputs[properties.total_charge].unsqueeze(-1)   # (n_mol,1)
+        else:
+            Q = torch.zeros((maxm, 1), device=chi.device, dtype=chi.dtype)
+
+        # ---------------------------
+        # diagonal closed-form branch
+        # ---------------------------
+        if not self.use_offdiag:
+            invJ = 1.0 / jii_eff
+            sum_invJ = snn.scatter_add(invJ, idx_m, dim_size=maxm).clamp_min(1e-12)
+            sum_g_over_J = snn.scatter_add((chi + phi) * invJ, idx_m, dim_size=maxm)
+
+            lam = -(Q + sum_g_over_J) / sum_invJ
+            q = -(chi + phi + lam[idx_m]) / jii_eff
+
+        # ---------------------------
+        # off-diagonal dense solve
+        # ---------------------------
+        else:
+            positions = inputs[properties.R]   # (N,3)
+            gamma = self._get_gamma()
+            inputs[self.gamma_key] = gamma.detach()
+
+            q_list = []
+            start = 0
+            for m in range(maxm):
+                n = int(natoms[m].item())
+                sl = slice(start, start + n)
+
+                Rm = positions[sl]                     # (n,3)
+                chim = chi[sl].squeeze(-1)            # (n,)
+                phim = phi[sl].squeeze(-1)            # (n,)
+                gm = chim + phim                      # (n,)
+                Jiim = jii_eff[sl].squeeze(-1)        # (n,)
+                Qm = Q[m].squeeze(-1)                 # scalar
+                sigmam = sigma[sl].squeeze(-1)        # (n,)
+
+                # pair distances
+                dR = Rm[:, None, :] - Rm[None, :, :]
+                Rij = torch.linalg.norm(dR, dim=-1)   # (n,n)
+
+                # screened Coulomb kernel
+                sigma_ij = torch.sqrt(
+                    sigmam[:, None] ** 2 + sigmam[None, :] ** 2
+                ) + 1e-12
+
+                eye = torch.eye(n, device=Rm.device, dtype=torch.bool)
+                Rij_safe = Rij.masked_fill(eye, 1.0)
+
+                Jij = torch.erf(Rij_safe / sigma_ij) / Rij_safe
+                Jij = Jij.masked_fill(eye, 0.0)
+
+                if self.offdiag_cutoff is not None:
+                    Jij = Jij * (Rij <= self.offdiag_cutoff)
+
+                A = torch.diag(Jiim) + gamma * Jij    # (n,n)
+
+                # KKT system
+                K = torch.zeros((n + 1, n + 1), device=Rm.device, dtype=Rm.dtype)
+                K[:n, :n] = A
+                K[:n, n] = 1.0
+                K[n, :n] = 1.0
+
+                b = torch.zeros((n + 1,), device=Rm.device, dtype=Rm.dtype)
+                b[:n] = -gm
+                b[n] = Qm
+
+                x = torch.linalg.solve(K, b)
+                qm = x[:n].unsqueeze(-1)
+                q_list.append(qm)
+
+                start += n
+
+            q = torch.cat(q_list, dim=0)
+
+        if self.correct_charges:
+            q_sum = snn.scatter_add(q, idx_m, dim_size=maxm)
+            dq = (Q - q_sum) / natoms.unsqueeze(-1)
+            q = q + dq[idx_m]
+
+        inputs[self.chi_key] = chi.squeeze(-1)
+        inputs[self.hardness_key] = jii_eff.squeeze(-1)
+        inputs[self.charges_key] = q.squeeze(-1)
+        return inputs
 class Charges(nn.Module):
     """
     Predicts Charges
@@ -227,7 +671,7 @@ class SpinCharges(nn.Module):
             else:
                 raise ValueError("Multiplicity required for spin‐resolved charge correction")
 
-            # Solve physical constraints:
+            # set up our physical constraints:
             Z_sum = snn.scatter_add(Z_atoms, idx_m, dim_size=maxm)[:, None]
             Q_alpha_req = 0.5*(Z_sum+Q_total - (M - 1))
             Q_beta_req  = 0.5*(Z_sum+Q_total + (M - 1))
@@ -377,6 +821,416 @@ class DipoleMoment(nn.Module):
         inputs[self.dipole_key] = y
         return inputs
 
+
+class EMLEStaticHead(nn.Module):
+    """
+    Static EMLE-style head:
+      - predicts geometry-dependent atomic charges
+      - predicts MBIS valence widths
+      - enforces exact molecular charge conservation
+
+    Intended first-stage use:
+      supervise against
+        * DB property "charges"
+        * DB property "mbis_valence_widths"
+
+    Notes
+    -----
+    - This is NOT QEq.
+    - It is the simplest stable first milestone for EMLE-style static training.
+    - Widths are predicted directly and constrained positive with softplus.
+    """
+
+    def __init__(
+        self,
+        n_in: int,
+        n_hidden: Optional[Union[int, Sequence[int]]] = None,
+        n_layers: int = 2,
+        activation: Callable = F.silu,
+        charges_key: str = "charges",
+        widths_key: str = "mbis_valence_widths",
+        correct_charges: bool = True,
+        width_min: float = 0.05,
+        width_max: Optional[float] = None,
+    ):
+        super().__init__()
+        self.charges_key = charges_key
+        self.widths_key = widths_key
+        self.correct_charges = correct_charges
+        self.width_min = float(width_min)
+        self.width_max = width_max
+
+        self.charge_net = spk.nn.build_mlp(
+            n_in=n_in,
+            n_out=1,
+            n_hidden=n_hidden,
+            n_layers=n_layers,
+            activation=activation,
+        )
+
+        self.width_net = spk.nn.build_mlp(
+            n_in=n_in,
+            n_out=1,
+            n_hidden=n_hidden,
+            n_layers=n_layers,
+            activation=activation,
+        )
+
+        self.model_outputs = [charges_key, widths_key]
+
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        l0 = inputs["scalar_representation"]          # (N_atoms, n_in)
+        idx_m = inputs[properties.idx_m]              # (N_atoms,)
+        natoms = inputs[properties.n_atoms]           # (N_mols,)
+        maxm = int(idx_m[-1]) + 1
+
+        # raw predictions
+        q = self.charge_net(l0)                       # (N_atoms, 1)
+        widths_raw = self.width_net(l0)               # (N_atoms, 1)
+
+        # positive widths
+        widths = F.softplus(widths_raw) + self.width_min
+        if self.width_max is not None:
+            widths = torch.clamp(widths, max=self.width_max)
+
+        # enforce exact total charge per molecule
+        if self.correct_charges:
+            q_sum = snn.scatter_add(q, idx_m, dim_size=maxm)
+
+            if properties.total_charge in inputs:
+                total_charge = inputs[properties.total_charge][:, None]
+            else:
+                total_charge = torch.zeros_like(q_sum)
+
+            dq = (total_charge - q_sum) / natoms.unsqueeze(-1)
+            q = q + dq[idx_m]
+
+        inputs[self.charges_key] = q.squeeze(-1)
+        inputs[self.widths_key] = widths.squeeze(-1)
+        return inputs
+
+class EMLEStaticParamHead(nn.Module):
+    """
+    EMLE static parameter head.
+
+    Predicts the geometry-dependent quantities needed for the EMLE static model:
+      - valence widths s_i  (target: MBIS valence widths)
+      - electronegativities chi_i (trained indirectly through QEq charge fitting)
+
+    This class does NOT solve QEq itself.
+    It only predicts the parameters that the EMLE QEq layer will consume.
+
+    Outputs
+    -------
+    widths_key : per-atom valence widths s_i
+    chi_key    : per-atom electronegativities chi_i
+    """
+
+    def __init__(
+        self,
+        n_in: int,
+        n_hidden: Optional[Union[int, Sequence[int]]] = None,
+        n_layers: int = 2,
+        activation: Callable = F.silu,
+        widths_key: str = "mbis_valence_widths",
+        chi_key: str = "chi_emle",
+        width_min: float = 0.05,
+        width_max: Optional[float] = None,
+    ):
+        super().__init__()
+        self.widths_key = widths_key
+        self.chi_key = chi_key
+        self.width_min = float(width_min)
+        self.width_max = width_max
+
+        self.width_net = spk.nn.build_mlp(
+            n_in=n_in,
+            n_out=1,
+            n_hidden=n_hidden,
+            n_layers=n_layers,
+            activation=activation,
+        )
+
+        self.chi_net = spk.nn.build_mlp(
+            n_in=n_in,
+            n_out=1,
+            n_hidden=n_hidden,
+            n_layers=n_layers,
+            activation=activation,
+        )
+
+        self.model_outputs = [widths_key, chi_key]
+
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        l0 = inputs["scalar_representation"]
+
+        widths_raw = self.width_net(l0)
+        widths = F.softplus(widths_raw) + self.width_min
+        if self.width_max is not None:
+            widths = torch.clamp(widths, max=self.width_max)
+
+        chi = self.chi_net(l0)
+
+        inputs[self.widths_key] = widths.squeeze(-1)
+        inputs[self.chi_key] = chi.squeeze(-1)
+        return inputs
+
+class EMLEQEqStatic(nn.Module):
+    """
+    EMLE-style static QEq layer with optional external electrostatic potential.
+
+    Unit convention
+    ---------------
+    - distances: Angstrom
+    - charges: e
+    - chi, phi, Jii, Jij: kJ/mol/e
+    - QEq energy: kJ/mol
+    """
+
+    def __init__(
+        self,
+        widths_key: str = "mbis_valence_widths",
+        chi_key: str = "chi_emle",
+        charges_key: str = "charges",
+        sigma_qeq_key: str = "sigma_qeq",
+        qcore_key: str = "q_core",
+        qval_key: str = "q_val",
+        hardness_key: str = "Jii_qeq",
+        aqeq_key: str = "a_qeq",
+        phi_key: Optional[str] = None,
+        max_z: int = 100,
+        qcore_table: Optional[Dict[int, float]] = None,
+        init_a_qeq: float = 1.0,
+        learn_a_qeq: bool = True,
+        a_qeq_positive: bool = True,
+        eps_sigma: float = 1e-8,
+        correct_charges: bool = True,
+        offdiag_cutoff: Optional[float] = None,
+    ):
+        super().__init__()
+        self.widths_key = widths_key
+        self.chi_key = chi_key
+        self.charges_key = charges_key
+        self.sigma_qeq_key = sigma_qeq_key
+        self.qcore_key = qcore_key
+        self.qval_key = qval_key
+        self.hardness_key = hardness_key
+        self.aqeq_key = aqeq_key
+        self.phi_key = phi_key
+
+        self.max_z = int(max_z)
+        self.eps_sigma = float(eps_sigma)
+        self.correct_charges = correct_charges
+        self.offdiag_cutoff = offdiag_cutoff
+        self.a_qeq_positive = a_qeq_positive
+
+        a_raw = torch.tensor(float(init_a_qeq))
+        if a_qeq_positive:
+            init_safe = max(float(init_a_qeq), 1e-8)
+            a_raw = torch.log(torch.exp(torch.tensor(init_safe)) - 1.0)
+
+        self.a_qeq_raw = nn.Parameter(a_raw)
+        if not learn_a_qeq:
+            self.a_qeq_raw.requires_grad_(False)
+
+        qcore_arr = torch.zeros(self.max_z + 1, dtype=torch.float32)
+        if qcore_table is not None:
+            for z, val in qcore_table.items():
+                z = int(z)
+                if z <= self.max_z:
+                    qcore_arr[z] = float(val)
+
+        self.register_buffer("qcore_table_tensor", qcore_arr)
+
+        self.model_outputs = [
+            charges_key,
+            sigma_qeq_key,
+            qcore_key,
+            qval_key,
+            hardness_key,
+            aqeq_key,
+        ]
+
+    def _get_a_qeq(self) -> torch.Tensor:
+        if self.a_qeq_positive:
+            return F.softplus(self.a_qeq_raw)
+        return self.a_qeq_raw
+
+    def _get_qcore(self, Z: torch.Tensor) -> torch.Tensor:
+        return self.qcore_table_tensor[Z.long()]
+
+    def _get_phi(self, inputs: Dict[str, torch.Tensor], like: torch.Tensor) -> torch.Tensor:
+        if self.phi_key is None or self.phi_key not in inputs:
+            return torch.zeros_like(like)
+
+        phi = inputs[self.phi_key]
+        if phi.dim() == 1:
+            phi = phi.unsqueeze(-1)
+        return phi.to(like)
+
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if self.widths_key not in inputs:
+            raise KeyError(f"Expected '{self.widths_key}' in inputs.")
+        if self.chi_key not in inputs:
+            raise KeyError(f"Expected '{self.chi_key}' in inputs.")
+
+        Z = inputs[properties.Z].long()
+        R = inputs[properties.R]
+        idx_m = inputs[properties.idx_m]
+        natoms = inputs[properties.n_atoms]
+        maxm = int(idx_m[-1]) + 1
+
+        s = inputs[self.widths_key]
+        chi = inputs[self.chi_key]
+
+        if s.dim() == 1:
+            s = s.unsqueeze(-1)
+        if chi.dim() == 1:
+            chi = chi.unsqueeze(-1)
+
+        phi = self._get_phi(inputs, chi)          # kJ/mol/e
+        g = chi + phi                             # kJ/mol/e
+
+        a_qeq = self._get_a_qeq()
+        sigma = torch.clamp(a_qeq * s, min=self.eps_sigma)  # Ang
+
+        # Gaussian self-energy hardness in kJ/mol/e^2
+        Jii = K_E_KJMOL_ANG_E2 / (sigma * math.sqrt(math.pi))
+
+        if properties.total_charge in inputs:
+            Q = inputs[properties.total_charge].unsqueeze(-1)
+        else:
+            Q = torch.zeros((maxm, 1), device=R.device, dtype=R.dtype)
+
+        q_list = []
+        start = 0
+
+        for m in range(maxm):
+            n = int(natoms[m].item())
+            sl = slice(start, start + n)
+
+            Rm = R[sl]
+            gm = g[sl].squeeze(-1)          # kJ/mol/e
+            sigmam = sigma[sl].squeeze(-1)  # Ang
+            Jiim = Jii[sl].squeeze(-1)      # kJ/mol/e^2
+            Qm = Q[m].squeeze(-1)
+
+            dR = Rm[:, None, :] - Rm[None, :, :]
+            Rij = torch.linalg.norm(dR, dim=-1)
+
+            sigma_ij = torch.sqrt(
+                sigmam[:, None] ** 2 + sigmam[None, :] ** 2
+            ).clamp_min(self.eps_sigma)
+
+            eye = torch.eye(n, device=Rm.device, dtype=torch.bool)
+            Rij_safe = Rij.masked_fill(eye, 1.0)
+
+            # off-diagonal Coulomb in kJ/mol/e^2
+            Jij = K_E_KJMOL_ANG_E2 * torch.erf(Rij_safe / sigma_ij) / Rij_safe
+            Jij = Jij.masked_fill(eye, 0.0)
+
+            if self.offdiag_cutoff is not None:
+                Jij = Jij * (Rij <= float(self.offdiag_cutoff))
+
+            A = torch.diag(Jiim) + Jij
+
+            K = torch.zeros((n + 1, n + 1), device=Rm.device, dtype=Rm.dtype)
+            K[:n, :n] = A
+            K[:n, n] = 1.0
+            K[n, :n] = 1.0
+            K[n, n] = 0.0
+
+            b = torch.zeros((n + 1,), device=Rm.device, dtype=Rm.dtype)
+            b[:n] = -gm
+            b[n] = Qm
+
+            x = torch.linalg.solve(K, b)
+            qm = x[:n].unsqueeze(-1)
+            q_list.append(qm)
+
+            start += n
+
+        q = torch.cat(q_list, dim=0)
+
+        if self.correct_charges:
+            q_sum = snn.scatter_add(q, idx_m, dim_size=maxm)
+            dq = (Q - q_sum) / natoms.unsqueeze(-1)
+            q = q + dq[idx_m]
+
+        q_core = self._get_qcore(Z).unsqueeze(-1)
+        q_val = q - q_core
+
+        inputs[self.charges_key] = q.squeeze(-1)
+        inputs[self.sigma_qeq_key] = sigma.squeeze(-1)
+        inputs[self.qcore_key] = q_core.squeeze(-1)
+        inputs[self.qval_key] = q_val.squeeze(-1)
+        inputs[self.hardness_key] = Jii.squeeze(-1)
+        inputs[self.aqeq_key] = a_qeq.expand_as(q).squeeze(-1)
+
+        return inputs
+    
+class ExternalCoulombEmbedding(nn.Module):
+    def __init__(
+        self,
+        charges_key="charges",
+        output_key="external_electrostatic_energy",
+        or_positions_key="or_positions",
+        or_charges_key="or_charges",
+        mask_key=None,
+        cutoff=None,
+        screening=None,
+        sigma=1.0,   # Å
+        coulomb_constant=14.3996454784255,  # eV*Å/e^2
+    ):
+        super().__init__()
+        self.charges_key = charges_key
+        self.output_key = output_key
+        self.or_positions_key = or_positions_key
+        self.or_charges_key = or_charges_key
+        self.mask_key = mask_key
+        self.cutoff = cutoff
+        self.screening = screening
+        self.sigma = sigma
+        self.coulomb_constant = coulomb_constant
+        self.model_outputs = [output_key]
+
+    def forward(self, inputs):
+        R = inputs[properties.R]                       # (N_qm, 3)
+        q = inputs[self.charges_key].unsqueeze(-1)    # (N_qm, 1)
+        idx_m = inputs[properties.idx_m]
+        maxm = int(idx_m[-1]) + 1
+
+        OR_R = inputs[self.or_positions_key]          # (N_qm, N_or, 3) or padded
+        OR_Q = inputs[self.or_charges_key]            # (N_qm, N_or)
+
+        # expand QM atoms molecule-wise
+        E_mol = []
+        for m in range(maxm):
+            sel = (idx_m == m)
+            Rm = R[sel]                               # (n, 3)
+            qm = q[sel]                               # (n, 1)
+
+            RJ = OR_R[m]                              # (M, 3)
+            QJ = OR_Q[m].unsqueeze(0)                 # (1, M)
+
+            dR = Rm[:, None, :] - RJ[None, :, :]      # (n, M, 3)
+            rij = torch.linalg.norm(dR, dim=-1)       # (n, M)
+
+            if self.screening == "erf":
+                v = torch.erf(rij / self.sigma) / rij.clamp_min(1e-8)
+            elif self.screening == "soft":
+                v = 1.0 / torch.sqrt(rij * rij + self.sigma * self.sigma)
+            else:
+                v = 1.0 / rij.clamp_min(1e-8)
+
+            if self.cutoff is not None:
+                v = v * (rij <= self.cutoff)
+
+            E = self.coulomb_constant * torch.sum(qm * QJ * v)
+            E_mol.append(E)
+
+        inputs[self.output_key] = torch.stack(E_mol, dim=0)
+        return inputs
 
 class Polarizability(nn.Module):
     """

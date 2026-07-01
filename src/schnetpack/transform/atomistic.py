@@ -212,7 +212,13 @@ class ScaleProperty(Transform):
     ) -> Dict[str, torch.Tensor]:
         inputs[self.output_key] = inputs[self.input_key] * self.scale
         return inputs
-
+    
+class SigmoidTransform(torch.nn.Module):
+    def forward(self, inputs):
+        inputs["boltzmann_weight_sextet"] = torch.sigmoid(
+            inputs["boltzmann_weight_sextet"]
+        )
+        return inputs
 
 class AddOffsets(Transform):
     """
