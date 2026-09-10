@@ -1,5 +1,5 @@
 import warnings
-from typing import Optional, Dict, List, Type, Any
+from typing import Optional, Dict, List, Type, Any, Mapping
 
 import pytorch_lightning as pl
 import torch
@@ -7,8 +7,48 @@ from torch import nn as nn
 from torchmetrics import Metric
 
 from schnetpack.model.base import AtomisticModel
+from schnetpack import properties
+from schnetpack.nn import scatter_add
 
-__all__ = ["ModelOutput", "AtomisticTask"]
+__all__ = [
+    "ModelOutput",
+    "AtomisticTask",
+    "FieldRegularizedAtomisticTask",
+    "center_moleculewise",
+    "elementwise_charge_bounds",
+]
+
+
+def center_moleculewise(
+    x: torch.Tensor, idx_m: torch.Tensor, n_atoms: torch.Tensor
+) -> torch.Tensor:
+    """Remove the per-molecule mean from an atom-wise tensor."""
+    if x.shape[0] != idx_m.shape[0]:
+        raise ValueError("x and idx_m must have the same atom dimension")
+    n_molecules = int(n_atoms.shape[0])
+    sums = scatter_add(x, idx_m, dim_size=n_molecules)
+    counts = n_atoms.to(device=x.device, dtype=x.dtype)
+    while counts.dim() < sums.dim():
+        counts = counts.unsqueeze(-1)
+    means = sums / counts.clamp_min(1)
+    return x - means[idx_m]
+
+
+def elementwise_charge_bounds(
+    Z: torch.Tensor, bounds_dict: Mapping[Any, float]
+) -> torch.Tensor:
+    """Construct per-atom absolute-charge limits from an element mapping."""
+    fallback = float(bounds_dict.get("default", bounds_dict.get("DEFAULT", 2.0)))
+    bounds = torch.full_like(Z, fallback, dtype=torch.get_default_dtype())
+    for atomic_number, value in bounds_dict.items():
+        if str(atomic_number).lower() == "default":
+            continue
+        bounds = torch.where(
+            Z == int(atomic_number),
+            bounds.new_tensor(float(value)),
+            bounds,
+        )
+    return bounds
 
 
 class ModelOutput(nn.Module):
@@ -300,6 +340,119 @@ class AtomisticTask(pl.LightningModule):
             torch.save(self.model, path)
             self.model.do_postprocessing = pp_status
 
+
+class FieldRegularizedAtomisticTask(AtomisticTask):
+    """Atomistic task with an auxiliary, unlabeled external-field charge pass.
+
+    If ``field_regularization`` is missing or disabled, this class follows the
+    exact :class:`AtomisticTask` training path. Field augmentation is applied
+    during training only; validation and testing remain zero-field only when
+    their input data are zero-field.
+    """
+
+    def __init__(self, *args, field_regularization=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        config = dict(field_regularization or {})
+        self.field_regularization = config
+        self.field_regularization_enabled = bool(config.get("enabled", False))
+        self.phi_key = config.get("phi_key", "phi_static")
+        self.phi_aug_key = config.get("phi_aug_key", "phi_static_aug")
+        self.field_mode = config.get("mode", "random")
+        self.phi_std = float(config.get("phi_std", 300.0))
+        self.phi_clip = config.get("phi_clip", None)
+        self.center_phi = bool(config.get("center_phi", True))
+        self.w_bound = float(config.get("w_bound", 0.0))
+        self.w_dq = float(config.get("w_dq", 0.0))
+        self.w_sensitivity = float(config.get("w_sensitivity", 0.0))
+        self.charges_key = config.get("charges_key", "charges")
+        self.charge_bounds = config.get("charge_bounds", {"default": 2.0})
+        self.save_hyperparameters({"field_regularization": config})
+
+        if self.field_mode not in ("random", "batch"):
+            raise ValueError("field_regularization.mode must be 'random' or 'batch'")
+        if self.phi_std < 0.0:
+            raise ValueError("field_regularization.phi_std must be non-negative")
+        if self.w_sensitivity != 0.0:
+            raise ValueError(
+                "w_sensitivity is reserved for a future Jacobian penalty; set it to 0"
+            )
+
+    def _zero_field_batch(self, batch):
+        zero_batch = dict(batch)
+        zero_batch[self.phi_key] = batch[properties.Z].new_zeros(
+            batch[properties.Z].shape, dtype=batch[properties.R].dtype
+        )
+        return zero_batch
+
+    def _augmented_field(self, batch):
+        source = None
+        if self.field_mode == "batch":
+            source = batch.get(self.phi_aug_key, batch.get(self.phi_key))
+        if source is None:
+            source = torch.randn_like(batch[properties.R][:, 0]) * self.phi_std
+        else:
+            source = source.to(device=batch[properties.R].device,
+                               dtype=batch[properties.R].dtype).clone()
+            if source.dim() > 1 and source.shape[-1] == 1:
+                source = source.squeeze(-1)
+        if self.center_phi:
+            source = center_moleculewise(
+                source, batch[properties.idx_m], batch[properties.n_atoms]
+            )
+        if self.phi_clip is not None:
+            source = source.clamp(-float(self.phi_clip), float(self.phi_clip))
+        return source
+
+    def training_step(self, batch, batch_idx):
+        if not self.field_regularization_enabled:
+            return super().training_step(batch, batch_idx)
+
+        targets = {
+            output.target_property: batch[output.target_property]
+            for output in self.outputs
+            if not isinstance(output, UnsupervisedModelOutput)
+        }
+        if "considered_atoms" in batch:
+            targets["considered_atoms"] = batch["considered_atoms"]
+
+        zero_batch = self._zero_field_batch(batch)
+        pred_zero = self.predict_without_postprocessing(zero_batch)
+        # Save the unconstrained charge tensor; output constraints may replace
+        # entries in the prediction dictionary (typically for force masking).
+        q_zero = pred_zero[self.charges_key]
+        pred_zero, targets = self.apply_constraints(pred_zero, targets)
+        supervised_loss = self.loss_fn(pred_zero, targets)
+
+        phi_aug = self._augmented_field(batch)
+        aug_batch = dict(batch)
+        # Keep force derivatives in the auxiliary forward independent from the
+        # supervised force graph. No auxiliary energy/force loss is evaluated.
+        aug_batch[properties.R] = batch[properties.R].detach().clone()
+        aug_batch[self.phi_key] = phi_aug
+        pred_aug = self.predict_without_postprocessing(aug_batch)
+
+        q_phi = pred_aug[self.charges_key]
+        bounds = elementwise_charge_bounds(
+            batch[properties.Z], self.charge_bounds
+        ).to(device=q_phi.device, dtype=q_phi.dtype)
+        while bounds.dim() < q_phi.dim():
+            bounds = bounds.unsqueeze(-1)
+        bound_loss = torch.relu(q_phi.abs() - bounds).square().mean()
+        dq_loss = (q_phi - q_zero.detach()).square().mean()
+        loss = supervised_loss + self.w_bound * bound_loss + self.w_dq * dq_loss
+
+        self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=False)
+        self.log_metrics(pred_zero, targets, "train")
+        for name, value in (
+            ("train_q_phi_abs_max", q_phi.detach().abs().max()),
+            ("train_q_phi_bound_loss", bound_loss.detach()),
+            ("train_q_phi_dq_loss", dq_loss.detach()),
+            ("train_phi_aug_min", phi_aug.detach().min()),
+            ("train_phi_aug_max", phi_aug.detach().max()),
+            ("train_phi_aug_std", phi_aug.detach().std(unbiased=False)),
+        ):
+            self.log(name, value, on_step=True, on_epoch=False, prog_bar=False)
+        return loss
 
 class ConsiderOnlySelectedAtoms(nn.Module):
     """

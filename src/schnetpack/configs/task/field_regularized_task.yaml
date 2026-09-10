@@ -1,0 +1,30 @@
+defaults:
+  - _self_
+  - optimizer: adam
+  - scheduler: reduce_on_plateau
+
+_target_: schnetpack.task.FieldRegularizedAtomisticTask
+outputs: ???
+warmup_steps: 0
+
+# The normal supervised pass always uses phi_static=0. The second pass has no
+# field-dependent labels and contributes only the regularizers below.
+# Configure the QEq output head with the same key, e.g.:
+# model.output_modules.<qeq-head>.phi_key: ${task.field_regularization.phi_key}
+field_regularization:
+  enabled: true
+  phi_key: phi_static
+  phi_aug_key: phi_static_aug
+  mode: random
+  phi_std: 300.0       # kJ/mol/e
+  phi_clip: 1000.0     # kJ/mol/e; set to null to disable clipping
+  center_phi: true
+  w_bound: 0.01
+  w_dq: 0.001
+  w_sensitivity: 0.0   # reserved; no sensitivity term is evaluated yet
+  charges_key: charges
+  charge_bounds:
+    1: 0.8
+    8: 1.5
+    26: 3.2
+    default: 2.0

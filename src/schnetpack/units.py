@@ -135,6 +135,9 @@ def _conversion_factor_ase(unit: str):
         raise Warning(
             "The unit string 'A' specifies Ampere. For Angstrom, please use 'Ang' or 'Angstrom'."
         )
+    # This makes unit strings like "kJ/mol/e" parseable.
+    if unit in ("e", "charge", "electron", "elementary_charge"):
+        return 1.0
     return getattr(aseunits, unit)
 
 

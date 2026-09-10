@@ -8,6 +8,7 @@ import schnetpack as spk
 import schnetpack.nn as snn
 import schnetpack.properties as properties
 import math
+import warnings
 
 __all__ = [
     "Atomwise",
@@ -983,8 +984,20 @@ class EMLEQEqStatic(nn.Module):
     ---------------
     - distances: Angstrom
     - charges: e
-    - chi, phi, Jii, Jij: kJ/mol/e
-    - QEq energy: kJ/mol
+    - chi, phi: kJ/mol/e
+    - Jii, Jij: kJ/mol/e^2
+    - embedding energy: kJ/mol
+
+    The external embedding currently couples total atomic point charges to
+    ``phi``. The core/valence outputs are diagnostic and do not select separate
+    electrostatic kernels.
+
+    Robustness controls
+    -------------------
+    The optional arguments ``a_qeq_min``, ``a_qeq_max``, ``sigma_qeq_min``,
+    ``sigma_qeq_max`` and ``jii_floor`` can be used to reduce excessive
+    external-field charge response during MD without requiring external-field
+    reference charges.
     """
 
     def __init__(
@@ -998,11 +1011,29 @@ class EMLEQEqStatic(nn.Module):
         hardness_key: str = "Jii_qeq",
         aqeq_key: str = "a_qeq",
         phi_key: Optional[str] = None,
+        charges_vac_key: str = "charges_vac",
+        charges_polarized_key: str = "charges",
+        embedding_energy_key: str = "qeq_embedding_energy",
+        qval_vac_key: str = "q_val_vac",
+        polarize_key: str = "qeq_polarize",
         max_z: int = 100,
         qcore_table: Optional[Dict[int, float]] = None,
         init_a_qeq: float = 1.0,
         learn_a_qeq: bool = True,
         a_qeq_positive: bool = True,
+
+        # Robustness controls for external-field MD.
+        # These are optional and backward-compatible:
+        # - If a_qeq_min/a_qeq_max are both None, the old softplus mapping is used.
+        # - If both are set, a_qeq is bounded to [a_qeq_min, a_qeq_max].
+        # - sigma_qeq_min/max clamp the final QEq Gaussian width sigma = a_qeq * s.
+        # - jii_floor is an additive diagonal hardness offset in kJ/mol/e^2.
+        a_qeq_min: Optional[float] = None,
+        a_qeq_max: Optional[float] = None,
+        sigma_qeq_min: Optional[float] = None,
+        sigma_qeq_max: Optional[float] = None,
+        jii_floor: float = 0.0,
+
         eps_sigma: float = 1e-8,
         correct_charges: bool = True,
         offdiag_cutoff: Optional[float] = None,
@@ -1017,6 +1048,11 @@ class EMLEQEqStatic(nn.Module):
         self.hardness_key = hardness_key
         self.aqeq_key = aqeq_key
         self.phi_key = phi_key
+        self.charges_vac_key = charges_vac_key
+        self.charges_polarized_key = charges_polarized_key
+        self.embedding_energy_key = embedding_energy_key
+        self.qval_vac_key = qval_vac_key
+        self.polarize_key = polarize_key
 
         self.max_z = int(max_z)
         self.eps_sigma = float(eps_sigma)
@@ -1024,14 +1060,47 @@ class EMLEQEqStatic(nn.Module):
         self.offdiag_cutoff = offdiag_cutoff
         self.a_qeq_positive = a_qeq_positive
 
-        a_raw = torch.tensor(float(init_a_qeq))
-        if a_qeq_positive:
-            init_safe = max(float(init_a_qeq), 1e-8)
-            a_raw = torch.log(torch.exp(torch.tensor(init_safe)) - 1.0)
+        # Optional robustness controls.
+        self.a_qeq_min = None if a_qeq_min is None else float(a_qeq_min)
+        self.a_qeq_max = None if a_qeq_max is None else float(a_qeq_max)
+        self.use_bounded_a_qeq = (self.a_qeq_min is not None) or (self.a_qeq_max is not None)
+
+        if self.use_bounded_a_qeq:
+            if self.a_qeq_min is None or self.a_qeq_max is None:
+                raise ValueError("Set both a_qeq_min and a_qeq_max, or neither.")
+            if not self.a_qeq_min < self.a_qeq_max:
+                raise ValueError("Require a_qeq_min < a_qeq_max.")
+            init_clamped = min(max(float(init_a_qeq), self.a_qeq_min), self.a_qeq_max)
+            frac = (init_clamped - self.a_qeq_min) / (self.a_qeq_max - self.a_qeq_min)
+            frac = min(max(frac, 1.0e-6), 1.0 - 1.0e-6)
+            a_raw = torch.logit(torch.tensor(frac, dtype=torch.float32))
+        else:
+            # Original behavior, preserved for old configs/checkpoints.
+            a_raw = torch.tensor(float(init_a_qeq), dtype=torch.float32)
+            if a_qeq_positive:
+                init_safe = max(float(init_a_qeq), 1e-8)
+                a_raw = torch.log(torch.exp(torch.tensor(init_safe, dtype=torch.float32)) - 1.0)
 
         self.a_qeq_raw = nn.Parameter(a_raw)
         if not learn_a_qeq:
             self.a_qeq_raw.requires_grad_(False)
+
+        self.sigma_qeq_min = None if sigma_qeq_min is None else float(sigma_qeq_min)
+        self.sigma_qeq_max = None if sigma_qeq_max is None else float(sigma_qeq_max)
+        if self.sigma_qeq_min is not None and self.sigma_qeq_min <= 0.0:
+            raise ValueError("sigma_qeq_min must be positive.")
+        if self.sigma_qeq_max is not None and self.sigma_qeq_max <= 0.0:
+            raise ValueError("sigma_qeq_max must be positive.")
+        if (
+            self.sigma_qeq_min is not None
+            and self.sigma_qeq_max is not None
+            and self.sigma_qeq_min > self.sigma_qeq_max
+        ):
+            raise ValueError("Require sigma_qeq_min <= sigma_qeq_max.")
+
+        self.jii_floor = float(jii_floor)
+        if self.jii_floor < 0.0:
+            raise ValueError("jii_floor must be non-negative.")
 
         qcore_arr = torch.zeros(self.max_z + 1, dtype=torch.float32)
         if qcore_table is not None:
@@ -1044,15 +1113,29 @@ class EMLEQEqStatic(nn.Module):
 
         self.model_outputs = [
             charges_key,
+            charges_vac_key,
+            embedding_energy_key,
             sigma_qeq_key,
             qcore_key,
             qval_key,
+            qval_vac_key,
             hardness_key,
             aqeq_key,
         ]
+        if charges_polarized_key not in self.model_outputs:
+            self.model_outputs.append(charges_polarized_key)
 
     def _get_a_qeq(self) -> torch.Tensor:
-        if self.a_qeq_positive:
+        # Full-module checkpoints store object attributes rather than rerunning
+        # __init__. Older EMLEQEqStatic checkpoints therefore do not contain
+        # the optional robustness attributes added later.
+        if getattr(self, "use_bounded_a_qeq", False):
+            # Bounded mapping for robust external-field MD.
+            # a_qeq_min <= a_qeq <= a_qeq_max
+            return self.a_qeq_min + (self.a_qeq_max - self.a_qeq_min) * torch.sigmoid(self.a_qeq_raw)
+
+        # Original behavior, preserved for old configs/checkpoints.
+        if getattr(self, "a_qeq_positive", True):
             return F.softplus(self.a_qeq_raw)
         return self.a_qeq_raw
 
@@ -1067,6 +1150,64 @@ class EMLEQEqStatic(nn.Module):
         if phi.dim() == 1:
             phi = phi.unsqueeze(-1)
         return phi.to(like)
+
+    def _build_qeq_matrix(
+        self,
+        R: torch.Tensor,
+        sigma: torch.Tensor,
+        Jii: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build one molecular QEq interaction matrix in kJ/mol/e^2."""
+        n = R.shape[0]
+        dR = R[:, None, :] - R[None, :, :]
+        Rij = torch.linalg.norm(dR, dim=-1)
+        sigma_ij = torch.sqrt(
+            sigma[:, None] ** 2 + sigma[None, :] ** 2
+        ).clamp_min(self.eps_sigma)
+
+        eye = torch.eye(n, device=R.device, dtype=torch.bool)
+        Rij_safe = Rij.masked_fill(eye, 1.0)
+        Jij = (
+            K_E_KJMOL_ANG_E2
+            * torch.erf(Rij_safe / (math.sqrt(2.0) * sigma_ij))
+            / Rij_safe
+        )
+        Jij = Jij.masked_fill(eye, 0.0)
+        if self.offdiag_cutoff is not None:
+            Jij = Jij * (Rij <= float(self.offdiag_cutoff))
+        return torch.diag(Jii) + Jij
+
+    @staticmethod
+    def _solve_qeq(
+        A: torch.Tensor,
+        g: torch.Tensor,
+        Q: torch.Tensor,
+    ) -> torch.Tensor:
+        """Solve a constrained molecular QEq problem differentiably."""
+        n = A.shape[0]
+        K = torch.zeros((n + 1, n + 1), device=A.device, dtype=A.dtype)
+        K[:n, :n] = A
+        K[:n, n] = 1.0
+        K[n, :n] = 1.0
+
+        b = torch.zeros((n + 1,), device=A.device, dtype=A.dtype)
+        b[:n] = -g
+        b[n] = Q
+        return torch.linalg.solve(K, b)[:n]
+
+    def _correct_total_charge(
+        self,
+        q: torch.Tensor,
+        Q: torch.Tensor,
+        idx_m: torch.Tensor,
+        natoms: torch.Tensor,
+        maxm: int,
+    ) -> torch.Tensor:
+        if not self.correct_charges:
+            return q
+        q_sum = snn.scatter_add(q, idx_m, dim_size=maxm)
+        dq = (Q - q_sum) / natoms.unsqueeze(-1)
+        return q + dq[idx_m]
 
     def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         if self.widths_key not in inputs:
@@ -1088,21 +1229,43 @@ class EMLEQEqStatic(nn.Module):
         if chi.dim() == 1:
             chi = chi.unsqueeze(-1)
 
-        phi = self._get_phi(inputs, chi)          # kJ/mol/e
-        g = chi + phi                             # kJ/mol/e
+        phi_available = self.phi_key is not None and self.phi_key in inputs
+        polarize_key = getattr(self, "polarize_key", "qeq_polarize")
+        polarize = phi_available
+        if polarize_key in inputs:
+            control = torch.as_tensor(inputs[polarize_key])
+            polarize = phi_available and bool(control.reshape(-1)[0].item())
+        phi = self._get_phi(inputs, chi)  # kJ/mol/e
 
         a_qeq = self._get_a_qeq()
-        sigma = torch.clamp(a_qeq * s, min=self.eps_sigma)  # Ang
+        sigma = a_qeq * s  # Ang
 
-        # Gaussian self-energy hardness in kJ/mol/e^2
+        # Clamp final QEq width sigma = a_qeq * s.
+        # This is the most important robustness control: overly large sigma
+        # makes Jii too small and the QEq response too polarizable.
+        sigma_qeq_min = getattr(self, "sigma_qeq_min", None)
+        sigma_qeq_max = getattr(self, "sigma_qeq_max", None)
+        sigma_min = self.eps_sigma if sigma_qeq_min is None else sigma_qeq_min
+        sigma = torch.clamp(sigma, min=sigma_min)
+        if sigma_qeq_max is not None:
+            sigma = torch.clamp(sigma, max=sigma_qeq_max)
+
+        # Gaussian self-energy hardness in kJ/mol/e^2.
+        # jii_floor is an additive diagonal hardness offset. It damps
+        # excessive external-field charge response without requiring
+        # external-field reference charges.
         Jii = K_E_KJMOL_ANG_E2 / (sigma * math.sqrt(math.pi))
+        jii_floor = getattr(self, "jii_floor", 0.0)
+        if jii_floor > 0.0:
+            Jii = Jii + jii_floor
 
         if properties.total_charge in inputs:
             Q = inputs[properties.total_charge].unsqueeze(-1)
         else:
             Q = torch.zeros((maxm, 1), device=R.device, dtype=R.dtype)
 
-        q_list = []
+        q0_list = []
+        qphi_list = []
         start = 0
 
         for m in range(maxm):
@@ -1110,62 +1273,77 @@ class EMLEQEqStatic(nn.Module):
             sl = slice(start, start + n)
 
             Rm = R[sl]
-            gm = g[sl].squeeze(-1)          # kJ/mol/e
+            chim = chi[sl].squeeze(-1)      # kJ/mol/e
+            phim = phi[sl].squeeze(-1)      # kJ/mol/e
             sigmam = sigma[sl].squeeze(-1)  # Ang
             Jiim = Jii[sl].squeeze(-1)      # kJ/mol/e^2
             Qm = Q[m].squeeze(-1)
 
-            dR = Rm[:, None, :] - Rm[None, :, :]
-            Rij = torch.linalg.norm(dR, dim=-1)
-
-            sigma_ij = torch.sqrt(
-                sigmam[:, None] ** 2 + sigmam[None, :] ** 2
-            ).clamp_min(self.eps_sigma)
-
-            eye = torch.eye(n, device=Rm.device, dtype=torch.bool)
-            Rij_safe = Rij.masked_fill(eye, 1.0)
-
-            # off-diagonal Coulomb in kJ/mol/e^2
-            Jij = K_E_KJMOL_ANG_E2 * torch.erf(Rij_safe / sigma_ij) / Rij_safe
-            Jij = Jij.masked_fill(eye, 0.0)
-
-            if self.offdiag_cutoff is not None:
-                Jij = Jij * (Rij <= float(self.offdiag_cutoff))
-
-            A = torch.diag(Jiim) + Jij
-
-            K = torch.zeros((n + 1, n + 1), device=Rm.device, dtype=Rm.dtype)
-            K[:n, :n] = A
-            K[:n, n] = 1.0
-            K[n, :n] = 1.0
-            K[n, n] = 0.0
-
-            b = torch.zeros((n + 1,), device=Rm.device, dtype=Rm.dtype)
-            b[:n] = -gm
-            b[n] = Qm
-
-            x = torch.linalg.solve(K, b)
-            qm = x[:n].unsqueeze(-1)
-            q_list.append(qm)
+            A = self._build_qeq_matrix(Rm, sigmam, Jiim)
+            q0m = self._solve_qeq(A, chim, Qm)
+            qphim = (
+                self._solve_qeq(A, chim + phim, Qm)
+                if polarize
+                else q0m
+            )
+            q0_list.append(q0m.unsqueeze(-1))
+            qphi_list.append(qphim.unsqueeze(-1))
 
             start += n
 
-        q = torch.cat(q_list, dim=0)
+        q0 = torch.cat(q0_list, dim=0)
+        qphi = torch.cat(qphi_list, dim=0)
+        q0 = self._correct_total_charge(q0, Q, idx_m, natoms, maxm)
+        qphi = self._correct_total_charge(qphi, Q, idx_m, natoms, maxm)
 
-        if self.correct_charges:
-            q_sum = snn.scatter_add(q, idx_m, dim_size=maxm)
-            dq = (Q - q_sum) / natoms.unsqueeze(-1)
-            q = q + dq[idx_m]
+        # Diagnostic guard only: retain production continuity while making a
+        # numerically significant constraint residual visible.
+        with torch.no_grad():
+            q0_residual = torch.max(
+                torch.abs(snn.scatter_add(q0, idx_m, dim_size=maxm) - Q)
+            )
+            qphi_residual = torch.max(
+                torch.abs(snn.scatter_add(qphi, idx_m, dim_size=maxm) - Q)
+            )
+            tolerance = 1.0e-5
+            if q0_residual > tolerance or qphi_residual > tolerance:
+                warnings.warn(
+                    "QEq total-charge residual exceeds tolerance: "
+                    f"vacuum={q0_residual.item():.3e}, "
+                    f"polarized={qphi_residual.item():.3e}",
+                    RuntimeWarning,
+                )
+
+        embedding_atom = 0.5 * (q0 + qphi) * phi
+        embedding_energy = snn.scatter_add(
+            embedding_atom, idx_m, dim_size=maxm
+        ).squeeze(-1)
 
         q_core = self._get_qcore(Z).unsqueeze(-1)
-        q_val = q - q_core
+        q_val = qphi - q_core
+        q_val_vac = q0 - q_core
 
-        inputs[self.charges_key] = q.squeeze(-1)
+        charges_vac_key = getattr(self, "charges_vac_key", "charges_vac")
+        charges_polarized_key = getattr(
+            self, "charges_polarized_key", self.charges_key
+        )
+        embedding_energy_key = getattr(
+            self, "embedding_energy_key", "qeq_embedding_energy"
+        )
+        qval_vac_key = getattr(self, "qval_vac_key", "q_val_vac")
+
+        inputs[charges_vac_key] = q0.squeeze(-1)
+        inputs[charges_polarized_key] = qphi.squeeze(-1)
+        # Keep the historical charges_key populated if a distinct polarized key
+        # was requested. Existing vacuum charge losses therefore need no changes.
+        inputs[self.charges_key] = qphi.squeeze(-1)
+        inputs[embedding_energy_key] = embedding_energy
         inputs[self.sigma_qeq_key] = sigma.squeeze(-1)
         inputs[self.qcore_key] = q_core.squeeze(-1)
         inputs[self.qval_key] = q_val.squeeze(-1)
+        inputs[qval_vac_key] = q_val_vac.squeeze(-1)
         inputs[self.hardness_key] = Jii.squeeze(-1)
-        inputs[self.aqeq_key] = a_qeq.expand_as(q).squeeze(-1)
+        inputs[self.aqeq_key] = a_qeq.expand_as(qphi).squeeze(-1)
 
         return inputs
     
