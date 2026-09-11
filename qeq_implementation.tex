@@ -1,0 +1,554 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  urlcolor=blue!55!black,
+  citecolor=blue!55!black
+}
+
+\lstdefinestyle{pythonstyle}{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!65!black},
+  commentstyle=\color{green!40!black},
+  stringstyle=\color{orange!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  frame=single,
+  breaklines=true,
+  showstringspaces=false,
+  columns=fullflexible
+}
+
+\newcommand{\vect}[1]{\bm{#1}}
+\newcommand{\ones}{\vect{1}}
+
+\title{Implementation Note: Direct Gaussian QEq and External-Field Regularization}
+\author{SchnetPack charge-prediction implementation}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note relates the implementation of \texttt{EMLEQEqStatic} in
+\path{src/schnetpack/atomistic/atomwise.py} to the underlying constrained
+charge-equilibration (QEq) equations.  The implementation constructs a dense
+Gaussian Coulomb matrix and solves the charge constraint directly with
+\texttt{torch.linalg.solve}.  It computes both a vacuum charge distribution and,
+when an external electrostatic potential is supplied, a polarized charge
+distribution.  The appendix documents the auxiliary field-regularized training
+task implemented in \path{src/schnetpack/task.py} and configured in
+\path{train_field_regularized.yaml}.
+\end{abstract}
+
+\section{Notation and units}
+
+For one structure containing $N$ atoms, let
+\begin{itemize}
+  \item $q_i$ be the total charge on atom $i$, in units of the elementary charge $e$;
+  \item $\chi_i$ be its environment-dependent electronegativity-like coefficient,
+        in \(\mathrm{kJ\,mol^{-1}\,e^{-1}}\);
+  \item $\phi_i$ be the external electrostatic potential at atom $i$, in
+        \(\mathrm{kJ\,mol^{-1}\,e^{-1}}\);
+  \item $\sigma_i$ be the Gaussian charge width, in \AA;
+  \item $Q$ be the prescribed total charge of the structure, in $e$; and
+  \item $A$ be the QEq interaction matrix, in
+        \(\mathrm{kJ\,mol^{-1}\,e^{-2}}\).
+\end{itemize}
+Vectors are denoted by bold symbols, and $\ones$ is the vector containing $N$
+ones.  The implementation uses a Coulomb conversion constant
+$k_e=\texttt{K\_E\_KJMOL\_ANG\_E2}$ so that distances in \AA{} produce energies in
+the units above.
+
+\section{The quadratic QEq problem}
+
+In vacuum, the charge-dependent energy is
+\begin{equation}
+  E_0(\vect q)
+  = \vect\chi^{\mathsf T}\vect q
+  + \frac{1}{2}\vect q^{\mathsf T}A\vect q,
+  \label{eq:vacuum-energy}
+\end{equation}
+subject to the total-charge constraint
+\begin{equation}
+  \ones^{\mathsf T}\vect q=Q.
+  \label{eq:charge-constraint}
+\end{equation}
+The linear term favors transfer according to the learned electronegativities,
+whereas the quadratic term penalizes self-charging and describes interatomic
+Coulomb interactions.
+
+If an external potential is present, its coupling to the charges is
+\begin{equation}
+  E_{\mathrm{ext}}(\vect q)=\vect\phi^{\mathsf T}\vect q.
+\end{equation}
+The polarized QEq energy therefore becomes
+\begin{equation}
+  E_{\phi}(\vect q)
+  =(\vect\chi+\vect\phi)^{\mathsf T}\vect q
+  +\frac{1}{2}\vect q^{\mathsf T}A\vect q,
+  \label{eq:polarized-energy}
+\end{equation}
+with the same constraint in Eq.~\eqref{eq:charge-constraint}.  The sign follows
+the implementation convention: the external potential is added to $\vect\chi$
+before solving.
+
+\section{Learned parameters and Gaussian widths}
+
+The neural-network parameter head produces an atom-wise valence width $s_i$ and
+an electronegativity $\chi_i$.  A learnable global scale $a_{\mathrm{QEq}}$
+converts the former into the QEq width,
+\begin{equation}
+  \sigma_i=a_{\mathrm{QEq}}s_i.
+\end{equation}
+The implementation is, schematically,
+\begin{lstlisting}[style=pythonstyle]
+s = inputs[self.widths_key]
+chi = inputs[self.chi_key]
+a_qeq = self._get_a_qeq()
+sigma = a_qeq * s
+\end{lstlisting}
+Optional lower and upper bounds are then applied to $\sigma_i$.  These bounds
+are numerical and physical robustness controls: a very large width yields a
+small self-hardness and can make the model excessively polarizable, whereas a
+vanishing width produces a very large hardness.
+
+\section{Construction of the QEq matrix}
+
+\subsection{Diagonal self-hardness}
+
+For the Gaussian convention used here, the diagonal term is
+\begin{equation}
+  A_{ii}=J_{ii}=\frac{k_e}{\sqrt{\pi}\,\sigma_i}.
+  \label{eq:self-hardness}
+\end{equation}
+The corresponding code is
+\begin{lstlisting}[style=pythonstyle]
+Jii = K_E_KJMOL_ANG_E2 / (sigma * math.sqrt(math.pi))
+if jii_floor > 0.0:
+    Jii = Jii + jii_floor
+\end{lstlisting}
+An optional positive \texttt{jii\_floor} increases every diagonal entry and
+damps the response to an external field.
+
+\subsection{Off-diagonal Gaussian Coulomb interaction}
+
+For atoms $i\ne j$, define
+\begin{align}
+  R_{ij} &= \lVert\vect R_i-\vect R_j\rVert,\\
+  \sigma_{ij} &= \sqrt{\sigma_i^2+\sigma_j^2}.
+\end{align}
+The off-diagonal matrix element is
+\begin{equation}
+  A_{ij}=J_{ij}
+  =k_e\frac{\operatorname{erf}\!\left(
+      R_{ij}/(\sqrt{2}\sigma_{ij})\right)}{R_{ij}}.
+  \label{eq:gaussian-coulomb}
+\end{equation}
+This is implemented by
+\begin{lstlisting}[style=pythonstyle]
+dR = R[:, None, :] - R[None, :, :]
+Rij = torch.linalg.norm(dR, dim=-1)
+sigma_ij = torch.sqrt(
+    sigma[:, None] ** 2 + sigma[None, :] ** 2
+).clamp_min(self.eps_sigma)
+
+Jij = (
+    K_E_KJMOL_ANG_E2
+    * torch.erf(Rij_safe / (math.sqrt(2.0) * sigma_ij))
+    / Rij_safe
+)
+Jij = Jij.masked_fill(eye, 0.0)
+A = torch.diag(Jii) + Jij
+\end{lstlisting}
+Gaussian smearing keeps the interaction finite at short range.  At large
+separation, $\operatorname{erf}(x)\rightarrow1$, so Eq.~\eqref{eq:gaussian-coulomb}
+approaches the point-charge interaction $k_e/R_{ij}$.  If
+\texttt{offdiag\_cutoff} is set, off-diagonal terms beyond that distance are set
+to zero.  The present training configuration uses a cutoff of $10$~\AA.
+
+\section{Constrained direct solution}
+
+Introduce a Lagrange multiplier $\lambda$ and the Lagrangian
+\begin{equation}
+  \mathcal L(\vect q,\lambda)
+  =\vect g^{\mathsf T}\vect q
+  +\frac{1}{2}\vect q^{\mathsf T}A\vect q
+  +\lambda(\ones^{\mathsf T}\vect q-Q),
+\end{equation}
+where $\vect g=\vect\chi$ in vacuum and
+$\vect g=\vect\chi+\vect\phi$ in the external field.  Stationarity gives
+\begin{align}
+  A\vect q+\vect g+\lambda\ones&=0,\\
+  \ones^{\mathsf T}\vect q&=Q.
+\end{align}
+These equations form the augmented system
+\begin{equation}
+  \underbrace{
+  \begin{bmatrix}
+    A & \ones\\
+    \ones^{\mathsf T} & 0
+  \end{bmatrix}}_{K}
+  \begin{bmatrix}
+    \vect q\\ \lambda
+  \end{bmatrix}
+  =
+  \begin{bmatrix}
+    -\vect g\\ Q
+  \end{bmatrix}.
+  \label{eq:augmented-system}
+\end{equation}
+The Python implementation constructs Eq.~\eqref{eq:augmented-system} literally:
+\begin{lstlisting}[style=pythonstyle]
+n = A.shape[0]
+K = torch.zeros((n + 1, n + 1), device=A.device, dtype=A.dtype)
+K[:n, :n] = A
+K[:n, n] = 1.0
+K[n, :n] = 1.0
+
+b = torch.zeros((n + 1,), device=A.device, dtype=A.dtype)
+b[:n] = -g
+b[n] = Q
+return torch.linalg.solve(K, b)[:n]
+\end{lstlisting}
+The final element of the full solution is $\lambda$; slicing with
+\texttt{[:n]} returns only the atomic charges.
+
+This is a dense direct linear solve, not an iterative self-consistency loop.
+Consequently, there is no QEq convergence tolerance or maximum iteration count.
+The mathematical stationary point is obtained up to floating-point roundoff
+and amplification by the condition number of $K$.  The augmented matrix is
+indefinite because of the constraint row and column, but it is solvable when the
+constrained QEq problem is well posed.
+
+\section{Vacuum and polarized passes}
+
+Each structure in a batch is solved separately.  The vacuum and polarized calls
+are
+\begin{lstlisting}[style=pythonstyle]
+A = self._build_qeq_matrix(Rm, sigmam, Jiim)
+q0m = self._solve_qeq(A, chim, Qm)
+qphim = (
+    self._solve_qeq(A, chim + phim, Qm)
+    if polarize
+    else q0m
+)
+\end{lstlisting}
+Thus, $\vect q_0$ solves
+\begin{equation}
+  A\vect q_0+\vect\chi+\lambda_0\ones=0,
+  \qquad \ones^{\mathsf T}\vect q_0=Q,
+\end{equation}
+whereas $\vect q_\phi$ solves
+\begin{equation}
+  A\vect q_\phi+\vect\chi+\vect\phi+\lambda_\phi\ones=0,
+  \qquad \ones^{\mathsf T}\vect q_\phi=Q.
+\end{equation}
+The matrix $A$ is identical in the two solves; only the linear term changes.
+Adding the same constant to all components of $\vect\phi$ does not change the
+charge distribution under an exact constrained solve.  It changes only the
+Lagrange multiplier.  This gauge invariance motivates molecule-wise centering
+of fields in the training augmentation described in Appendix~\ref{app:field}.
+
+\section{Finite-precision charge correction and warning}
+
+Although Eq.~\eqref{eq:augmented-system} contains the total-charge constraint,
+finite-precision arithmetic can leave a small residual.  For each structure the
+implementation computes
+\begin{equation}
+  \Delta q=\frac{Q-\sum_iq_i}{N}
+\end{equation}
+and shifts every charge uniformly,
+\begin{equation}
+  q_i\leftarrow q_i+\Delta q.
+\end{equation}
+The code is
+\begin{lstlisting}[style=pythonstyle]
+q_sum = snn.scatter_add(q, idx_m, dim_size=maxm)
+dq = (Q - q_sum) / natoms.unsqueeze(-1)
+q = q + dq[idx_m]
+\end{lstlisting}
+Even after this operation, the subsequent floating-point summation can retain a
+small residual.  The code warns if either
+\begin{equation}
+  r_0=\max_m\left|\sum_{i\in m}q_{0,i}-Q_m\right|
+  \quad\text{or}\quad
+  r_\phi=\max_m\left|\sum_{i\in m}q_{\phi,i}-Q_m\right|
+\end{equation}
+exceeds $10^{-5}e$.  This value is a post-solve diagnostic threshold, not a
+solver convergence criterion.  A large or repeated residual can indicate an
+ill-conditioned QEq matrix, extreme charge cancellation, or insufficient
+floating-point precision.  The configured training precision is 32 bit.
+
+\section{External-field embedding energy}
+
+The implementation reports
+\begin{equation}
+  E_{\mathrm{emb}}
+  =\frac{1}{2}(\vect q_0+\vect q_\phi)^{\mathsf T}\vect\phi,
+  \label{eq:embedding-energy}
+\end{equation}
+using
+\begin{lstlisting}[style=pythonstyle]
+embedding_atom = 0.5 * (q0 + qphi) * phi
+embedding_energy = scatter_add(embedding_atom, idx_m)
+\end{lstlisting}
+Equation~\eqref{eq:embedding-energy} is the linear-response charging expression:
+as the external potential is turned on, the charge changes linearly from
+$\vect q_0$ to $\vect q_\phi$, whose path average is
+$(\vect q_0+\vect q_\phi)/2$.
+
+\section{Core and valence diagnostic outputs}
+
+Only after solving QEq does the implementation look up an element-dependent
+core charge,
+\begin{align}
+  q_{\mathrm{val},i}^{\phi}&=q_{\phi,i}-q_{\mathrm{core},i},\\
+  q_{\mathrm{val},i}^{0}&=q_{0,i}-q_{\mathrm{core},i}.
+\end{align}
+The corresponding code is
+\begin{lstlisting}[style=pythonstyle]
+q_core = self._get_qcore(Z).unsqueeze(-1)
+q_val = qphi - q_core
+q_val_vac = q0 - q_core
+\end{lstlisting}
+Therefore, \texttt{qcore\_table} does not enter the QEq matrix, linear term,
+total-charge constraint, charge solution, or embedding energy.  It affects only
+the reported core/valence decomposition.  In the present configuration the
+table contains $1.0$ for H, $6.35$ for O, and $4.46$ for Fe.
+
+\section{Computational characteristics}
+
+For $N$ QEq atoms, explicitly storing the dense matrix costs
+$\mathcal O(N^2)$ memory and its direct factorization costs approximately
+$\mathcal O(N^3)$ work.  This approach is attractive for small and medium-sized
+QEq regions because it has no iterative convergence error and is directly
+differentiable through PyTorch.  For very large systems, a sparse or
+matrix-free iterative method can be faster and use less memory.  A direct solve
+is not automatically immune to numerical error: poor conditioning can amplify
+roundoff in either direct or iterative methods.
+
+\appendix
+\section{Field-regularized training task}
+\label{app:field}
+
+\subsection{Purpose and two-pass training structure}
+
+\texttt{FieldRegularizedAtomisticTask} augments ordinary supervised training
+with a second, unlabeled external-field pass.  The purpose is to discourage
+unphysical charge magnitudes and excessive field-induced charge transfer when
+field-dependent reference labels are unavailable.
+
+For every training batch, the task performs:
+\begin{enumerate}
+  \item a zero-field forward pass, used for the ordinary supervised loss; and
+  \item an augmented-field forward pass, used only for charge regularization.
+\end{enumerate}
+When field regularization is disabled, the class delegates directly to the
+standard \texttt{AtomisticTask}.  The override is confined to
+\texttt{training\_step}; validation and testing follow the normal task path and
+do not receive random field augmentation.
+
+\subsection{Supervised zero-field pass}
+
+The task makes a shallow copy of the batch and explicitly sets the external
+potential to zero at every atom:
+\begin{lstlisting}[style=pythonstyle]
+zero_batch = dict(batch)
+zero_batch[self.phi_key] = batch[properties.Z].new_zeros(
+    batch[properties.Z].shape, dtype=batch[properties.R].dtype
+)
+pred_zero = self.predict_without_postprocessing(zero_batch)
+q_zero = pred_zero[self.charges_key]
+supervised_loss = self.loss_fn(pred_zero, targets)
+\end{lstlisting}
+For the supplied training configuration, the supervised composite loss is
+\begin{equation}
+  \mathcal L_{\mathrm{sup}}
+  =0.05\,\mathrm{MSE}(V)
+  +0.70\,\mathrm{MSE}(\vect F)
+  +0.15\,\mathrm{MSE}(\vect q_0)
+  +0.10\,\mathrm{MSE}(\vect s).
+  \label{eq:supervised-loss}
+\end{equation}
+Here $V$ is \texttt{V\_BuRNN}, $\vect F$ is \texttt{F\_BuRNN}, and $\vect s$
+denotes \texttt{mbis\_valence\_widths}.  The implementation stores
+\texttt{q\_zero} before output constraints are applied, because such constraints
+may replace entries in the prediction dictionary.
+
+\subsection{Generation of the augmented field}
+
+Two field modes are supported:
+\begin{description}
+  \item[\texttt{random}] Draw an independent value for each atom,
+    $\widetilde\phi_i\sim\mathcal N(0,\sigma_\phi^2)$.
+  \item[\texttt{batch}] Read the field from \texttt{phi\_static\_aug}, falling
+    back to \texttt{phi\_static}; if neither is present, generate a random field.
+\end{description}
+In random mode the implementation starts from
+\begin{lstlisting}[style=pythonstyle]
+source = torch.randn_like(batch[properties.R][:, 0]) * self.phi_std
+\end{lstlisting}
+If molecule-wise centering is enabled, it applies
+\begin{equation}
+  \phi_i\leftarrow\widetilde\phi_i
+  -\frac{1}{N_m}\sum_{j\in m}\widetilde\phi_j,
+  \qquad i\in m.
+  \label{eq:field-centering}
+\end{equation}
+This removes the physically redundant constant-potential component separately
+for every molecule.  The result is then clipped component-wise:
+\begin{equation}
+  \phi_i\leftarrow\operatorname{clip}
+  (\phi_i,-\phi_{\max},\phi_{\max}).
+\end{equation}
+Clipping after centering can reintroduce a small nonzero molecular mean when
+individual components hit the bounds; this has no effect on exact constrained
+QEq charge differences, although finite-precision effects remain possible.
+
+The current configuration uses
+\begin{equation}
+  \sigma_\phi=300\ \mathrm{kJ\,mol^{-1}\,e^{-1}},
+  \qquad
+  \phi_{\max}=1000\ \mathrm{kJ\,mol^{-1}\,e^{-1}},
+\end{equation}
+with centering enabled.
+
+\subsection{Auxiliary polarized pass}
+
+The field is placed under the same key read by \texttt{EMLEQEqStatic}, and the
+model is evaluated again:
+\begin{lstlisting}[style=pythonstyle]
+aug_batch = dict(batch)
+aug_batch[properties.R] = batch[properties.R].detach().clone()
+aug_batch[self.phi_key] = phi_aug
+pred_aug = self.predict_without_postprocessing(aug_batch)
+q_phi = pred_aug[self.charges_key]
+\end{lstlisting}
+The detached copy of the positions keeps force derivatives in this auxiliary
+forward pass independent of the supervised force graph.  No auxiliary energy
+or force label is used.  Gradients from the charge regularizers still propagate
+through $\vect q_\phi$ into the QEq parameter head and the shared neural-network
+representation.
+
+\subsection{Element-dependent charge-bound penalty}
+
+Let $b_i=b(Z_i)$ be the configured absolute charge bound for atom $i$.  The
+penalty is a squared hinge loss,
+\begin{equation}
+  \mathcal L_{\mathrm{bound}}
+  =\frac{1}{N_{\mathrm{batch\ atoms}}}
+   \sum_i\left[\max\left(|q_{\phi,i}|-b_i,0\right)\right]^2.
+  \label{eq:bound-loss}
+\end{equation}
+It is zero inside the allowed interval and grows quadratically outside it.  The
+configured bounds are
+\begin{center}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Element & Atomic number & $b(Z)$ in $e$\\
+\midrule
+H  & 1  & 0.8\\
+O  & 8  & 1.5\\
+Fe & 26 & 3.2\\
+Other elements & --- & 2.0\\
+\bottomrule
+\end{tabular}
+\end{center}
+The bound is on the total QEq charge $q_{\phi,i}$, not on the diagnostic valence
+charge derived from \texttt{qcore\_table}.
+
+\subsection{Field-induced charge-change penalty}
+
+The second auxiliary term is
+\begin{equation}
+  \mathcal L_{\Delta q}
+  =\frac{1}{N_{\mathrm{batch\ atoms}}}
+   \sum_i(q_{\phi,i}-\operatorname{stopgrad}(q_{0,i}))^2.
+  \label{eq:dq-loss}
+\end{equation}
+The code uses
+\begin{lstlisting}[style=pythonstyle]
+dq_loss = (q_phi - q_zero.detach()).square().mean()
+\end{lstlisting}
+Detaching $\vect q_0$ means this auxiliary term treats the zero-field charges as
+a fixed reference during backpropagation.  It pushes only the polarized branch
+toward that reference and does not use the regularizer to move the reference
+charges themselves.  The term limits field sensitivity, but it is not an
+explicit Jacobian norm such as $\lVert\partial\vect q/\partial\vect\phi\rVert^2$.
+The configuration key \texttt{w\_sensitivity} is reserved for such a future
+penalty and must currently be zero.
+
+\subsection{Complete training objective}
+
+The final per-batch objective is
+\begin{equation}
+  \boxed{
+  \mathcal L
+  =\mathcal L_{\mathrm{sup}}
+  +w_{\mathrm{bound}}\mathcal L_{\mathrm{bound}}
+  +w_{\Delta q}\mathcal L_{\Delta q}}
+  \label{eq:total-loss}
+\end{equation}
+with the present weights
+\begin{equation}
+  w_{\mathrm{bound}}=0.01,
+  \qquad
+  w_{\Delta q}=0.001.
+\end{equation}
+Both regularizers are unsupervised: they require neither polarized reference
+charges nor field-dependent energies and forces.  Their numerical influence
+depends on their raw scales as well as the displayed weights, so logged loss
+components should be inspected rather than interpreting the weights alone.
+
+\subsection{Logged diagnostics}
+
+During training, the task logs the following batch-level diagnostics:
+\begin{itemize}
+  \item maximum polarized absolute charge,
+        \texttt{train\_q\_phi\_abs\_max};
+  \item unweighted bound penalty,
+        \texttt{train\_q\_phi\_bound\_loss};
+  \item unweighted charge-change penalty,
+        \texttt{train\_q\_phi\_dq\_loss}; and
+  \item minimum, maximum, and population standard deviation of the augmented
+        potential.
+\end{itemize}
+These quantities make it possible to distinguish an overly strong field
+distribution from an overly responsive QEq model and to assess the actual scale
+of each auxiliary contribution to Eq.~\eqref{eq:total-loss}.
+
+\subsection{Current configuration summary}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Setting & Current value\\
+\midrule
+Task & \texttt{FieldRegularizedAtomisticTask}\\
+Field key read by QEq & \texttt{phi\_static}\\
+Augmentation mode & \texttt{random}\\
+Random-field standard deviation & $300\ \mathrm{kJ\,mol^{-1}\,e^{-1}}$\\
+Absolute clip & $1000\ \mathrm{kJ\,mol^{-1}\,e^{-1}}$\\
+Molecule-wise centering & enabled\\
+$w_{\mathrm{bound}}$ & $0.01$\\
+$w_{\Delta q}$ & $0.001$\\
+Explicit Jacobian penalty & not implemented; weight fixed to zero\\
+Training precision & 32 bit\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

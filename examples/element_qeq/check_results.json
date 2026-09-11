@@ -1,0 +1,11 @@
+{
+  "database_count": 4945,
+  "train_structures": 32,
+  "validation_structures": 8,
+  "steps": 300,
+  "initial_validation_charge_rmse_e": 0.48420989513397217,
+  "final_validation_charge_rmse_e": 0.09315946698188782,
+  "train_charge_rmse_e": 0.08727383613586426,
+  "max_charge_constraint_error_e": 3.5762786865234375e-07,
+  "full_model_backward_finite": true
+}

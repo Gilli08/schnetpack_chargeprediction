@@ -112,9 +112,24 @@ import schnetpack.properties as properties
 
 class ElementQEqCharges(nn.Module):
     """
-    Conservative QEq head with optional off-diagonal couplings.
-    - chi(Z), Jii(Z) are learnable tables (geometry-independent).
-    - Optional Jij(Rij) introduces geometry dependence but remains conservative.
+    Element-table QEq minimizing chi.q + phi.q + 0.5*q.T*A*q at fixed Q.
+
+    Diagonal mode assigns identical charges to identical elements in a structure.
+    Off-diagonal mode uses erf(r / sqrt(a_i**2 + a_j**2)) / r.
+    With add_gaussian_self=True, positive gamma and no cutoff, A is the
+    positive-semidefinite Gaussian Coulomb matrix plus positive learned hardness.
+    This guarantees a unique minimum, including for coincident atoms.
+
+    Distances and widths share units; gamma has hardness times distance units.
+    chi and phi must use consistent energy/charge units. No Coulomb conversion
+    factor is inserted automatically. This head predicts charges only: a separate
+    energy module and its position derivatives are needed for electrostatic forces.
+    Dense, nonperiodic structures only; the charge constraint applies to each
+    structure, not each chemical molecule within a mixture.
+
+    add_gaussian_self=False reproduces the historical independent diagonal;
+    it does not guarantee convexity. Existing fitted off-diagonal models must
+    explicitly select that legacy setting when reconstructing from a state dict.
     """
 
     def __init__(
@@ -125,8 +140,8 @@ class ElementQEqCharges(nn.Module):
         max_z=100,
         eps_hardness=1e-6,
         correct_charges=True,
-        use_offdiag=False,
-        offdiag_cutoff=10.0,
+        use_offdiag=True,
+        offdiag_cutoff=None,
         learn_gamma: bool = True,
         init_gamma: float = 1.0,
         gamma_positive: bool = True,
@@ -137,6 +152,7 @@ class ElementQEqCharges(nn.Module):
         init_chi=0.0,
         init_logJ=0.0,
         phi_key=None,     # if provided, use inputs[phi_key], else 0
+        add_gaussian_self=True,
     ):
         super().__init__()
         self.charges_key = charges_key
@@ -149,6 +165,16 @@ class ElementQEqCharges(nn.Module):
         self.offdiag_cutoff = offdiag_cutoff
         self.learn_widths = learn_widths
         self.phi_key = phi_key
+        self.add_gaussian_self = add_gaussian_self
+        if eps_hardness <= 0 or init_width <= 0:
+            raise ValueError("eps_hardness and init_width must be positive.")
+        if use_offdiag and add_gaussian_self and not gamma_positive:
+            raise ValueError("Gaussian self hardness requires positive gamma.")
+        if use_offdiag and offdiag_cutoff is not None:
+            warnings.warn(
+                "A hard QEq cutoff makes charges discontinuous and can destroy "
+                "convexity. Use offdiag_cutoff=None for MD.", UserWarning
+            )
 
         self.chi_table = nn.Embedding(max_z + 1, 1)
         self.logJ_table = nn.Embedding(max_z + 1, 1)
@@ -173,19 +199,14 @@ class ElementQEqCharges(nn.Module):
             # inverse softplus so that softplus(raw) ~= init_gamma
             # avoid init_gamma<=0
             init_gamma_safe = max(float(init_gamma), 1e-6)
-            gamma_raw = torch.log(torch.exp(torch.tensor(init_gamma_safe)) - 1.0)
+            gamma_raw = torch.tensor(init_gamma_safe) + torch.log(-torch.expm1(-torch.tensor(init_gamma_safe)))
 
         self.gamma_raw = nn.Parameter(gamma_raw)
 
         if not learn_gamma:
             self.gamma_raw.requires_grad_(False)
 
-        # optional: expose gamma for logging/extraction
-        self.model_outputs = list(getattr(self, "model_outputs", []))
-        if self.gamma_key not in self.model_outputs:
-            self.model_outputs.append(self.gamma_key)
-
-        self.model_outputs = [charges_key, chi_key, hardness_key]
+        self.model_outputs = [charges_key, chi_key, hardness_key, gamma_key]
 
     def _phi(self, inputs, like):
         if self.phi_key is not None and self.phi_key in inputs:
@@ -199,16 +220,23 @@ class ElementQEqCharges(nn.Module):
         Z = inputs[properties.Z].long()              # (N_atoms,)
         idx_m = inputs[properties.idx_m]             # (N_atoms,)
         natoms = inputs[properties.n_atoms]          # (N_mols,)
-        maxm = int(idx_m[-1]) + 1
+        maxm = natoms.numel()
+        if self.use_offdiag and properties.pbc in inputs and inputs[properties.pbc].any():
+            raise ValueError("ElementQEqCharges off-diagonal mode does not support PBC.")
+        gamma = F.softplus(self.gamma_raw) if self.gamma_positive else self.gamma_raw
 
         chi = self.chi_table(Z)                      # (N_atoms,1)
         Jii = F.softplus(self.logJ_table(Z)) + self.eps_hardness
+
+        if self.use_offdiag and getattr(self, "add_gaussian_self", False):
+            widths = self.width_table(Z).abs().clamp_min(1e-6)
+            Jii = Jii + gamma * math.sqrt(2.0 / math.pi) / widths
 
         phi = self._phi(inputs, chi)                 # (N_atoms,1) or 0
         g = chi + phi                                # (N_atoms,1)
 
         if properties.total_charge in inputs:
-            Q = inputs[properties.total_charge].unsqueeze(-1)  # (N_mols,1)
+            Q = inputs[properties.total_charge].reshape(maxm, 1).to(chi)  # (N_mols,1)
         else:
             Q = torch.zeros((maxm, 1), device=chi.device, dtype=chi.dtype)
 
@@ -236,40 +264,34 @@ class ElementQEqCharges(nn.Module):
                 Qm = Q[m].squeeze(-1)                 # scalar
 
                 Rm = positions[sl]                    # (n,3)
-                # pair distances
-                dR = Rm[:, None, :] - Rm[None, :, :]
-                Rij = torch.linalg.norm(dR + 1e-12, dim=-1)  # (n,n)
-
-                # build A
-                A = torch.diag(Jiim)  # (n,n)
-
-                # screened Coulomb off-diagonal
-                widths = self.width_table(Zm).squeeze(-1)               # (n,)
-                sigma = torch.sqrt(widths[:, None] ** 2 + widths[None, :] ** 2) + 1e-12
-
-                dR = Rm[:, None, :] - Rm[None, :, :]
-                Rij = torch.linalg.norm(dR, dim=-1)                     # (n,n)
-
+                A = torch.diag(Jiim)
+                widths = self.width_table(Zm).squeeze(-1).abs().clamp_min(1e-6)
+                sigma = torch.sqrt(widths[:, None] ** 2 + widths[None, :] ** 2)
+                # Use a Taylor series near zero to keep first and second
+                # derivatives finite, even on the diagonal/coincident atoms.
+                r2 = ((Rm[:, None, :] - Rm[None, :, :]) ** 2).sum(-1)
+                t = r2 / sigma.square()
+                small = t < 1e-6
+                safe_t = t.clamp_min(1e-6)
+                regular = torch.erf(torch.sqrt(safe_t)) / (sigma * torch.sqrt(safe_t))
+                series = 2.0 / math.sqrt(math.pi) / sigma * (1 - t / 3 + t.square() / 10)
+                Jij = torch.where(small, series, regular)
                 eye = torch.eye(n, device=Rm.device, dtype=torch.bool)
-                Rij_safe = Rij.masked_fill(eye, 1.0)
-
-                Jij = torch.erf(Rij_safe / sigma) / Rij_safe
                 Jij = Jij.masked_fill(eye, 0.0)
 
                 if self.offdiag_cutoff is not None:
-                    Jij = Jij * (Rij <= self.offdiag_cutoff)
+                    Jij = Jij * (r2 <= self.offdiag_cutoff ** 2)
 
-                gamma = F.softplus(self.gamma_raw) if self.gamma_positive else self.gamma_raw
                 A = A + gamma * Jij
                 
                 # KKT system
-                K = torch.zeros((n + 1, n + 1), device=Rm.device, dtype=Rm.dtype)
+                K = torch.zeros((n + 1, n + 1), device=A.device, dtype=A.dtype)
                 K[:n, :n] = A
                 K[:n, n] = 1.0
                 K[n, :n] = 1.0
                 K[n, n] = 0.0
 
-                b = torch.zeros((n + 1,), device=Rm.device, dtype=Rm.dtype)
+                b = torch.zeros((n + 1,), device=A.device, dtype=A.dtype)
                 b[:n] = -gm
                 b[n] = Qm
 
@@ -291,8 +313,7 @@ class ElementQEqCharges(nn.Module):
         inputs[self.hardness_key] = Jii.squeeze(-1)
         inputs[self.charges_key] = q.squeeze(-1)
         
-        gamma = F.softplus(self.gamma_raw) if self.gamma_positive else self.gamma_raw
-        inputs[self.gamma_key] = gamma.detach()  # or keep grad if you want
+        inputs[self.gamma_key] = gamma.detach()  # diagnostic output
         return inputs
 class QEqCharges(nn.Module):
     """
@@ -912,14 +933,14 @@ class EMLEStaticHead(nn.Module):
 
 class EMLEStaticParamHead(nn.Module):
     """
-    EMLE static parameter head.
+    Neural QEq static parameter head.
 
-    Predicts the geometry-dependent quantities needed for the EMLE static model:
+    Predicts the geometry-dependent quantities needed for themodel:
       - valence widths s_i  (target: MBIS valence widths)
       - electronegativities chi_i (trained indirectly through QEq charge fitting)
 
     This class does NOT solve QEq itself.
-    It only predicts the parameters that the EMLE QEq layer will consume.
+    It only predicts the parameters that the neural QEq layer will consume.
 
     Outputs
     -------
@@ -978,7 +999,7 @@ class EMLEStaticParamHead(nn.Module):
 
 class EMLEQEqStatic(nn.Module):
     """
-    EMLE-style static QEq layer with optional external electrostatic potential.
+    neural QEq layer with optional external electrostatic potential.
 
     Unit convention
     ---------------
