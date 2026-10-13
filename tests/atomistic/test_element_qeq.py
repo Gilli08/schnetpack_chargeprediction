@@ -97,3 +97,47 @@ def test_reject_periodic_and_large_gamma():
         head()(data)
     model = head(init_gamma=1389.35456)
     assert torch.isfinite(model.gamma_raw)
+
+
+@pytest.mark.parametrize('offdiag', [False, True])
+@pytest.mark.parametrize('polarize', [False, True])
+def test_gromos_embedding_energy_and_field_derivative(offdiag, polarize):
+    data = inputs()
+    model = head(offdiag, qeq_energy_scale=20.)
+    data['qeq_polarize'] = torch.tensor(polarize)
+    phi = torch.linspace(-2., 3., 9, dtype=torch.double, requires_grad=True)
+    out = model({**data, 'phi_static': phi})
+    q0 = model(dict(inputs()))['charges']
+    torch.testing.assert_close(out['charges_vac'], q0)
+    if not polarize:
+        torch.testing.assert_close(out['charges'], q0)
+    expected = torch.zeros(2, dtype=torch.double).index_add(
+        0, data[p.idx_m], .5 * (q0 + out['charges']) * phi)
+    torch.testing.assert_close(out['qeq_embedding_energy'], expected)
+    dq = torch.autograd.grad(out['qeq_embedding_energy'].sum(), phi)[0]
+    torch.testing.assert_close(dq, out['charges'])
+    r = data[p.R].requires_grad_()
+    outer = torch.tensor([[8., 1., 0.], [-4., -2., 1.]], dtype=torch.double, requires_grad=True)
+    def energy(r, outer):
+        field = (torch.tensor([.3, -.2], dtype=r.dtype) /
+                 ((r[:, None] - outer[None])**2).sum(-1).sqrt()).sum(-1)
+        return model({**data, p.R: r, 'phi_static': field})['qeq_embedding_energy']
+    assert gradcheck(energy, (r, outer))
+    assert gradgradcheck(energy, (r, outer))
+
+
+def test_legacy_pickled_attributes_and_scale_guard(tmp_path):
+    model = head()
+    for name in ['charges_vac_key', 'embedding_energy_key', 'polarize_key', 'qeq_energy_scale']:
+        delattr(model, name)
+    model.model_outputs = ['charges', 'chi_qeq', 'Jii_qeq', 'gamma_qeq']
+    path = tmp_path / 'legacy.pt'
+    torch.save(model, path)
+    model = torch.load(path, weights_only=False)
+    data = {**inputs(), 'phi_static': torch.ones(9, dtype=torch.double),
+            'qeq_polarize': torch.tensor(False)}
+    out = model(dict(data))
+    torch.testing.assert_close(out['charges'], out['charges_vac'])
+    torch.testing.assert_close(out['qeq_embedding_energy'], data[p.total_charge])
+    with pytest.raises(ValueError, match='qeq_energy_scale'):
+        model({**data, 'qeq_polarize': torch.tensor(True)})

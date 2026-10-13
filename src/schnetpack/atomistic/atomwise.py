@@ -18,9 +18,9 @@ __all__ = [
     "SpinCharges",
     "QEqCharges",
     "ElementQEqCharges",
-    "EMLEStaticHead",
-    "EMLEStaticParamHead",
-    "EMLEQEqStatic",
+    "neuralQEqStaticHead",
+    "neuralQEqParamHead",
+    "neuralQEq",
     "ExternalCoulombEmbedding",
 ]
 
@@ -122,8 +122,13 @@ class ElementQEqCharges(nn.Module):
 
     Distances and widths share units; gamma has hardness times distance units.
     chi and phi must use consistent energy/charge units. No Coulomb conversion
-    factor is inserted automatically. This head predicts charges only: a separate
-    energy module and its position derivatives are needed for electrostatic forces.
+    factor is inserted automatically. The head returns charges_vac, charges and
+    qeq_embedding_energy for the GROMOS B2 interface. phi_static is accepted when
+    phi_key is None, including on older pickled models. qeq_polarize=False keeps
+    vacuum charges but still returns their interaction energy with the field.
+    For GROMOS polarization, explicitly set qeq_energy_scale to convert model
+    energy units to kJ/mol; zero-field charge labels cannot determine this scale.
+    The interface differentiates the embedding energy to obtain forces.
     Dense, nonperiodic structures only; the charge constraint applies to each
     structure, not each chemical molecule within a mixture.
 
@@ -153,8 +158,21 @@ class ElementQEqCharges(nn.Module):
         init_logJ=0.0,
         phi_key=None,     # if provided, use inputs[phi_key], else 0
         add_gaussian_self=True,
+        charges_vac_key="charges_vac",
+        embedding_energy_key="qeq_embedding_energy",
+        polarize_key="qeq_polarize",
+        qeq_energy_scale=None,
+
     ):
         super().__init__()
+        self.charges_vac_key = charges_vac_key
+        self.embedding_energy_key = embedding_energy_key
+        self.polarize_key = polarize_key
+        if qeq_energy_scale is not None and (
+            not math.isfinite(qeq_energy_scale) or qeq_energy_scale <= 0
+        ):
+            raise ValueError("qeq_energy_scale must be finite and positive.")
+        self.qeq_energy_scale = qeq_energy_scale
         self.charges_key = charges_key
         self.chi_key = chi_key
         self.hardness_key = hardness_key
@@ -206,7 +224,8 @@ class ElementQEqCharges(nn.Module):
         if not learn_gamma:
             self.gamma_raw.requires_grad_(False)
 
-        self.model_outputs = [charges_key, chi_key, hardness_key, gamma_key]
+        self.model_outputs = [charges_key, chi_key, hardness_key, gamma_key,
+                              charges_vac_key, embedding_energy_key]
 
     def _phi(self, inputs, like):
         if self.phi_key is not None and self.phi_key in inputs:
@@ -217,6 +236,52 @@ class ElementQEqCharges(nn.Module):
         return torch.zeros_like(like)
 
     def forward(self, inputs):
+        # Defaults are also required for previously pickled full-module models:
+        # torch.load does not run __init__ on those objects.
+        vac_key = getattr(self, "charges_vac_key", "charges_vac")
+        energy_key = getattr(self, "embedding_energy_key", "qeq_embedding_energy")
+        control_key = getattr(self, "polarize_key", "qeq_polarize")
+        # GROMOS supplies phi_static even for old heads trained with phi_key=None.
+        field_key = self.phi_key or "phi_static"
+        has_field = field_key in inputs
+        polarize = has_field
+        if control_key in inputs:
+            polarize = has_field and bool(inputs[control_key].reshape(-1)[0].item())
+
+        vacuum_inputs = dict(inputs)
+        if self.phi_key is not None:
+            vacuum_inputs.pop(self.phi_key, None)
+        vacuum = self._forward_charges(vacuum_inputs)
+        q0 = vacuum[self.charges_key]
+        phi = inputs[field_key].reshape_as(q0).to(q0) if has_field else torch.zeros_like(q0)
+        qphi = q0
+        if polarize:
+            scale = getattr(self, "qeq_energy_scale", None)
+            if scale is None and (control_key in inputs or self.phi_key is None):
+                raise ValueError(
+                    "Polarized GROMOS ElementQEqCharges requires qeq_energy_scale "
+                    "(kJ/mol per model energy unit). Set 1.0 only for parameters "
+                    "already in kJ/mol units; vacuum charge fits do not determine "
+                    "this scale. Vacuum mode does not require it."
+                )
+            scale = 1.0 if scale is None else scale
+            # Pass the field explicitly rather than changing module attributes.
+            polarized = self._forward_charges(dict(inputs), phi_override=phi / scale)
+            qphi = polarized[self.charges_key]
+
+        inputs.update({key: vacuum[key] for key in
+                       (self.chi_key, self.hardness_key, self.gamma_key)})
+        inputs[self.charges_key] = qphi
+        inputs[vac_key] = q0
+        # Exact quadratic-QEq minimum energy difference. In vacuum mode this
+        # reduces to q0.phi, including dq0/dR in the embedding forces.
+        inputs[energy_key] = snn.scatter_add(
+            0.5 * (q0 + qphi) * phi, inputs[properties.idx_m],
+            dim_size=inputs[properties.n_atoms].numel(),
+        )
+        return inputs
+
+    def _forward_charges(self, inputs, phi_override=None):
         Z = inputs[properties.Z].long()              # (N_atoms,)
         idx_m = inputs[properties.idx_m]             # (N_atoms,)
         natoms = inputs[properties.n_atoms]          # (N_mols,)
@@ -232,7 +297,7 @@ class ElementQEqCharges(nn.Module):
             widths = self.width_table(Z).abs().clamp_min(1e-6)
             Jii = Jii + gamma * math.sqrt(2.0 / math.pi) / widths
 
-        phi = self._phi(inputs, chi)                 # (N_atoms,1) or 0
+        phi = self._phi(inputs, chi) if phi_override is None else phi_override.reshape_as(chi)                 # (N_atoms,1) or 0
         g = chi + phi                                # (N_atoms,1)
 
         if properties.total_charge in inputs:
@@ -250,7 +315,7 @@ class ElementQEqCharges(nn.Module):
 
         else:
             # ---- off-diagonal: build per-molecule dense systems and solve
-            # NOTE: This is a simple implementation. For speed you can batch/pack.
+            # This is a rather simple not optimized for speed implementation.
             positions = inputs[properties.R]          # (N_atoms,3)
             q_list = []
             start = 0
@@ -844,9 +909,9 @@ class DipoleMoment(nn.Module):
         return inputs
 
 
-class EMLEStaticHead(nn.Module):
+class neuralQEqStaticHead(nn.Module):
     """
-    Static EMLE-style head:
+    Static neuralQEq head:
       - predicts geometry-dependent atomic charges
       - predicts MBIS valence widths
       - enforces exact molecular charge conservation
@@ -859,7 +924,7 @@ class EMLEStaticHead(nn.Module):
     Notes
     -----
     - This is NOT QEq.
-    - It is the simplest stable first milestone for EMLE-style static training.
+    - It is the simplest stable first milestone for neuralQEq static training.
     - Widths are predicted directly and constrained positive with softplus.
     """
 
@@ -931,11 +996,13 @@ class EMLEStaticHead(nn.Module):
         inputs[self.widths_key] = widths.squeeze(-1)
         return inputs
 
-class EMLEStaticParamHead(nn.Module):
+
+
+class neuralQEqParamHead(nn.Module):
     """
     Neural QEq static parameter head.
 
-    Predicts the geometry-dependent quantities needed for themodel:
+    Predicts the geometry-dependent quantities needed for the model:
       - valence widths s_i  (target: MBIS valence widths)
       - electronegativities chi_i (trained indirectly through QEq charge fitting)
 
@@ -955,7 +1022,7 @@ class EMLEStaticParamHead(nn.Module):
         n_layers: int = 2,
         activation: Callable = F.silu,
         widths_key: str = "mbis_valence_widths",
-        chi_key: str = "chi_emle",
+        chi_key: str = "chi_qeq",
         width_min: float = 0.05,
         width_max: Optional[float] = None,
     ):
@@ -997,9 +1064,15 @@ class EMLEStaticParamHead(nn.Module):
         inputs[self.chi_key] = chi.squeeze(-1)
         return inputs
 
-class EMLEQEqStatic(nn.Module):
+
+
+class neuralQEq(nn.Module):
     """
-    neural QEq layer with optional external electrostatic potential.
+    Neural charge equilibration (QEq) with optional external electrostatic potential.
+
+    Consumes atom-wise widths and electronegativities predicted by
+    ``neuralQEqParamHead`` and solves for charges constrained to each
+    molecule's total charge.
 
     Unit convention
     ---------------
@@ -1024,7 +1097,7 @@ class EMLEQEqStatic(nn.Module):
     def __init__(
         self,
         widths_key: str = "mbis_valence_widths",
-        chi_key: str = "chi_emle",
+        chi_key: str = "chi_qeq",
         charges_key: str = "charges",
         sigma_qeq_key: str = "sigma_qeq",
         qcore_key: str = "q_core",
@@ -1148,7 +1221,7 @@ class EMLEQEqStatic(nn.Module):
 
     def _get_a_qeq(self) -> torch.Tensor:
         # Full-module checkpoints store object attributes rather than rerunning
-        # __init__. Older EMLEQEqStatic checkpoints therefore do not contain
+        # __init__. Older full-module checkpoints therefore do not contain
         # the optional robustness attributes added later.
         if getattr(self, "use_bounded_a_qeq", False):
             # Bounded mapping for robust external-field MD.
@@ -1367,7 +1440,9 @@ class EMLEQEqStatic(nn.Module):
         inputs[self.aqeq_key] = a_qeq.expand_as(qphi).squeeze(-1)
 
         return inputs
-    
+
+
+
 class ExternalCoulombEmbedding(nn.Module):
     def __init__(
         self,

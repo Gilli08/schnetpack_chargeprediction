@@ -182,16 +182,16 @@ model:
     energy_key: ${globals.property}
     force_key: F_BuRNN
 
-  - _target_: schnetpack.atomistic.EMLEStaticParamHead
+  - _target_: schnetpack.atomistic.neuralQEqParamHead
     n_in: ${model.representation.n_atom_basis}
     widths_key: mbis_valence_widths
-    chi_key: chi_emle
+    chi_key: chi_qeq
     width_min: 0.05
     width_max: 3.5
 
-  - _target_: schnetpack.atomistic.EMLEQEqStatic
+  - _target_: schnetpack.atomistic.neuralQEq
     widths_key: mbis_valence_widths
-    chi_key: chi_emle
+    chi_key: chi_qeq
     charges_key: charges
     sigma_qeq_key: sigma_qeq
     qcore_key: q_core

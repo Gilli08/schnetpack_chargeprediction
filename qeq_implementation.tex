@@ -42,7 +42,7 @@
 \maketitle
 
 \begin{abstract}
-This note relates the implementation of \texttt{EMLEQEqStatic} in
+This note relates the implementation of \texttt{neuralQEq} in
 \path{src/schnetpack/atomistic/atomwise.py} to the underlying constrained
 charge-equilibration (QEq) equations.  The implementation constructs a dense
 Gaussian Coulomb matrix and solves the charge constraint directly with
@@ -428,7 +428,7 @@ with centering enabled.
 
 \subsection{Auxiliary polarized pass}
 
-The field is placed under the same key read by \texttt{EMLEQEqStatic}, and the
+The field is placed under the same key read by \texttt{neuralQEq}, and the
 model is evaluated again:
 \begin{lstlisting}[style=pythonstyle]
 aug_batch = dict(batch)
