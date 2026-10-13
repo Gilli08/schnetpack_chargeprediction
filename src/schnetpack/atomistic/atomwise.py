@@ -15,7 +15,6 @@ __all__ = [
     "DipoleMoment",
     "Polarizability",
     "Charges",
-    "SpinCharges",
     "ElementQEqCharges",
     "neuralQEqParamHead",
     "neuralQEq",
